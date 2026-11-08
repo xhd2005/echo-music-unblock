@@ -1,0 +1,26 @@
+{
+  "id": "echo-music-unblock",
+  "name": "音源解灰与歌词兜底",
+  "version": "1.0.0",
+  "description": "无版权/灰歌自动解灰与音质提权：支持本地曲库直通、酷狗同曲异版智能替换、多平台外部音源接入与双语歌词兜底，内置播放栏音源徽标与手动换源面板。",
+  "author": "xhd2005",
+  "icon": "icon.svg",
+  "main": "index.js",
+  "tags": [
+    "audio-source",
+    "lyrics",
+    "unblock",
+    "player-bar",
+    "quality"
+  ],
+  "capabilities": {
+    "audioSource": true,
+    "lyrics": true,
+    "kugouApi": true,
+    "localFiles": true,
+    "unrestrictedNetwork": true
+  },
+  "requires": {
+    "echoMusicVersion": ">=2.3.2"
+  }
+}

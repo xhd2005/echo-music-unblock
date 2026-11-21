@@ -1,6 +1,8 @@
 # 灰歌解灰与多源换源 (`echo-music-unblock`)
 
-为 **EchoMusic (`>= 2.3.2`)** 打造的**全链路灰歌自动解灰、无损提质、手动换源与双语歌词兜底插件**（当前版本：`v1.1.0`）。
+为 **EchoMusic (`>= 2.3.2`)** 打造的**全链路灰歌自动解灰、无损提质、手动换源与双语歌词兜底插件**（当前版本：`v1.1.1`）。
+
+> **v1.1.1 修复**：全面将外部聚合源（GDStudio / Meting / 网易云 / 自定义 API）请求从 `ctx.net.fetch` 迁移至主进程无 CORS 限制的 `ctx.net.request` 并加装硬超时，彻底修复部分外部源解析卡死或被 CORS 拦截的问题。
 
 当酷狗曲库中遇到无版权灰歌、下架歌曲、地区限制或仅提供试听片段时，插件会自动在后台按优先级从**本地曲库 / 酷狗同曲异版 / 多平台外部聚合源**无缝解析可用音源，并支持通过底栏胶囊或歌曲右键菜单一键打开原生换源弹窗。
 
@@ -38,7 +40,7 @@ https://raw.githubusercontent.com/xhd2005/echo-music-plugins/main/echo-plugins.j
 
 ### 方式二：手动安装
 
-下载最新 Release 中的 `echo-music-unblock-1.1.0.zip`，在 EchoMusic 插件页面选择导入安装。
+下载最新 Release 中的 `echo-music-unblock-1.1.1.zip`，在 EchoMusic 插件页面选择导入安装。
 
 ---
 

@@ -679,30 +679,72 @@ const createUnblockEngine = (ctx) => {
   };
 
   // 通道 3：外部多平台音源接口 (Custom API + GDStudio / Meting / 网易云兜底)
-  const netFetchJson = async (url, options = {}) => {
-    if (typeof ctx.net?.fetch === 'function') {
-      const res = await ctx.net.fetch({
-        url,
-        method: options.method || 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          Accept: 'application/json, text/plain, */*',
-          ...(options.headers || {}),
-        },
-        responseType: 'json',
-        timeoutMs: options.timeoutMs || 8000,
+  // 使用 EchoMusic 宿主无限制 Node HTTP 客户端 ctx.net.request（免 CORS 且支持真实 timeoutMs）
+  const netRequestRaw = async (url, options = {}) => {
+    const timeoutMs = options.timeoutMs || 7000;
+    const reqInit = {
+      url,
+      method: options.method || 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Accept: 'application/json, text/plain, */*',
+        ...(options.headers || {}),
+      },
+      responseType: options.responseType || 'json',
+      timeoutMs,
+      ...(options.maxRedirects != null ? { maxRedirects: options.maxRedirects } : {}),
+    };
+    if (typeof ctx.net?.request === 'function') {
+      let timer = null;
+      const timeoutP = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('网络请求超时')), timeoutMs + 1500);
       });
-      if (res && res.status >= 200 && res.status < 400) {
-        if (typeof res.data === 'string') {
-          try {
-            return JSON.parse(res.data);
-          } catch {
-            return res.data;
-          }
-        }
-        return res.data;
+      try {
+        return await Promise.race([ctx.net.request(reqInit), timeoutP]);
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     }
+    if (typeof globalThis.fetch === 'function') {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = setTimeout(() => {
+        try {
+          controller?.abort();
+        } catch {}
+      }, timeoutMs);
+      try {
+        const res = await globalThis.fetch(url, {
+          method: reqInit.method,
+          headers: reqInit.headers,
+          signal: controller?.signal,
+        });
+        const body =
+          reqInit.responseType === 'text'
+            ? await res.text()
+            : await res.json().catch(() => null);
+        return { ok: res.ok, status: res.status, url: res.url, body };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    return null;
+  };
+
+  const netFetchJson = async (url, options = {}) => {
+    try {
+      const res = await netRequestRaw(url, { ...options, responseType: 'json' });
+      if (res && res.status >= 200 && res.status < 400) {
+        const payload = res.body !== undefined ? res.body : res.data;
+        if (typeof payload === 'string') {
+          try {
+            return JSON.parse(payload);
+          } catch {
+            return payload;
+          }
+        }
+        return payload;
+      }
+    } catch {}
     return null;
   };
 
@@ -936,22 +978,19 @@ const createUnblockEngine = (ctx) => {
     if (cand.sourcePlatform === 'netease' && cand.externalId) {
       try {
         const metingUrl = `https://api.i-meto.com/meting/api?server=netease&type=url&id=${encodeURIComponent(cand.externalId)}`;
-        if (typeof ctx.net?.fetch === 'function') {
-          const res = await ctx.net.fetch({
-            url: metingUrl,
-            method: 'GET',
-            responseType: 'text',
-            maxRedirects: 5,
-            timeoutMs: 6500,
-          });
-          const finalUrl = String(res?.url || '').trim();
-          if (
-            /^https?:\/\//i.test(finalUrl) &&
-            !finalUrl.includes('api.i-meto.com') &&
-            !finalUrl.endsWith('/404')
-          ) {
-            return { url: finalUrl, urls: [finalUrl], quality: '320' };
-          }
+        const res = await netRequestRaw(metingUrl, {
+          method: 'GET',
+          responseType: 'text',
+          maxRedirects: 5,
+          timeoutMs: 6500,
+        });
+        const finalUrl = String(res?.url || '').trim();
+        if (
+          /^https?:\/\//i.test(finalUrl) &&
+          !finalUrl.includes('api.i-meto.com') &&
+          !finalUrl.endsWith('/404')
+        ) {
+          return { url: finalUrl, urls: [finalUrl], quality: '320' };
         }
       } catch {}
     }

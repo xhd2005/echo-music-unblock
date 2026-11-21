@@ -1,16 +1,25 @@
-// 音源解灰与歌词兜底插件 (echo-music-unblock v1.0.0)
-// 基于 EchoMusic v2.3.2+ 的 ctx.player.audioSource.register 与 ctx.lyrics.registerResolver：
+// 音源解灰与歌词兜底插件 (echo-music-unblock v1.1.0)
+// 基于 EchoMusic v2.3.2+ 原生极简组件规范与 ctx.player.audioSource / ctx.lyrics：
 // 1. 本地授权目录无损/音频直通 (local)
 // 2. 酷狗同曲异版智能替换 (kugou-alt)
 // 3. 外部多平台音源接口解灰 (external: GDStudio / Meting / 网易云 / 自定义 API)
-// 4. 多源双语歌词兜底 (本地 .lrc / 酷狗异版 / LRCLIB / 网易云原文+翻译双语合并)
-// 5. 播放栏实时音源徽标 + 手动换源诊断弹窗 + 跨插件下载桥接 (globalThis.__echoMusicUnblock)
+// 4. 描述符持久化锁定与过期外链按需刷新 (pinned) + 仅本次试听 (session override)
+// 5. 多源双语歌词兜底 (本地 .lrc / 酷狗异版 / 网易云原文+翻译双语合并 / LRCLIB)
+// 6. 原生 Dialog 换源弹窗 + 原生 Tabs/Drawer/Popconfirm 管理中心 + 跨插件下载协同
 
+const PLUGIN_VERSION = '1.1.0';
 const STORAGE_SETTINGS = 'emu.settings.v1';
 const STORAGE_PINNED = 'emu.pinned.v1';
 const STORAGE_HISTORY = 'emu.history.v1';
 const MAX_HISTORY_ITEMS = 80;
 const LOCAL_SCAN_LIMIT = 10000;
+const PINNED_URL_TTL_MS = 20 * 60 * 1000;
+
+const EXTERNAL_PLATFORMS = [
+  { id: 'netease', label: '网易云音乐', short: 'NETEASE' },
+  { id: 'kuwo', label: '酷我音乐', short: 'KUWO' },
+  { id: 'tencent', label: 'QQ 音乐', short: 'TENCENT' },
+];
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -27,13 +36,20 @@ const DEFAULT_SETTINGS = {
 };
 
 const CHANNEL_META = {
-  pinned: { label: '锁定源', short: '锁定', tone: 'primary' },
-  local: { label: '本地曲库', short: '本地', tone: 'success' },
-  'kugou-alt': { label: '酷狗异版', short: '异版', tone: 'warning' },
-  external: { label: '外部音源', short: '解灰', tone: 'accent' },
+  pinned: { label: '锁定源', short: '锁定' },
+  local: { label: '本地曲库', short: '本地' },
+  'kugou-alt': { label: '酷狗异版', short: '异版' },
+  external: { label: '外部音源', short: '解灰' },
 };
 
-// ---- 文本归一化与相似度计算 ----
+const CHANNEL_FILTERS = [
+  { id: 'all', label: '全部' },
+  { id: 'local', label: '本地' },
+  { id: 'kugou-alt', label: '酷狗异版' },
+  { id: 'external', label: '外部' },
+];
+
+// ---- 文本归一化、时长格式化与相似度计算 ----
 
 const UNWANTED_VARIANT_RE = /(伴奏|卡拉ok|karaoke|instrumental|off\s*vocal|纯音乐版|dj版|dj\s*remix|慢摇|喊麦)/i;
 
@@ -45,6 +61,37 @@ const normalizeText = (value) => {
     .replace(/\b(feat\.?|ft\.?|live|ver\.?|version|remaster(?:ed)?)\b/gi, '')
     .replace(/[^\p{L}\p{N}]/gu, '')
     .trim();
+};
+
+const formatDuration = (sec) => {
+  const total = Math.round(Number(sec) || 0);
+  if (total <= 0) return '';
+  const mins = Math.floor(total / 60);
+  const rem = total % 60;
+  return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
+};
+
+const formatDurationCompare = (targetSec, candSec) => {
+  const cand = Math.round(Number(candSec) || 0);
+  if (cand <= 0) return '';
+  const fmt = formatDuration(cand);
+  const target = Math.round(Number(targetSec) || 0);
+  if (target <= 0) return fmt;
+  const diff = cand - target;
+  if (Math.abs(diff) <= 2) return `${fmt} · 时长一致`;
+  return `${fmt} (${diff > 0 ? '+' : ''}${diff}s)`;
+};
+
+const formatShortTime = (timestamp) => {
+  const ts = Number(timestamp) || 0;
+  if (!ts) return '';
+  try {
+    const d = new Date(ts);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch {
+    return '';
+  }
 };
 
 const extractSongMeta = (song) => {
@@ -62,7 +109,12 @@ const extractSongMeta = (song) => {
   ).trim();
   const album = String(song.album ?? song.albumName ?? song.AlbumName ?? song.album_name ?? '').trim();
   const rawDur = Number(song.duration ?? song.Duration ?? song.timelength ?? 0);
-  const duration = Number.isFinite(rawDur) && rawDur > 0 ? (rawDur > 10000 ? Math.round(rawDur / 1000) : Math.round(rawDur)) : 0;
+  const duration =
+    Number.isFinite(rawDur) && rawDur > 0
+      ? rawDur > 10000
+        ? Math.round(rawDur / 1000)
+        : Math.round(rawDur)
+      : 0;
   const hash = String(song.hash ?? song.FileHash ?? song.filehash ?? '').trim();
   const id = String(song.id ?? song.mixSongId ?? song.albumAudioId ?? hash ?? '').trim();
   const coverUrl = String(song.coverUrl ?? song.cover ?? song.img ?? song.Image ?? '').trim();
@@ -70,6 +122,7 @@ const extractSongMeta = (song) => {
 };
 
 const getTrackKey = (song) => {
+  if (typeof song === 'string') return song.trim();
   const meta = extractSongMeta(song);
   if (meta.hash) return `hash:${meta.hash.toLowerCase()}`;
   if (meta.id) return `id:${meta.id}`;
@@ -82,7 +135,6 @@ const calcTitleSimilarity = (targetTitle, candTitle) => {
   const a = normalizeText(targetTitle);
   const b = normalizeText(candTitle);
   if (!a || !b) return 0;
-  // 防止普通原曲误匹配伴奏/DJ版
   const targetHasVariant = UNWANTED_VARIANT_RE.test(String(targetTitle || ''));
   const candHasVariant = UNWANTED_VARIANT_RE.test(String(candTitle || ''));
   if (!targetHasVariant && candHasVariant) return 0.15;
@@ -143,7 +195,7 @@ const scoreCandidate = (targetMeta, candMeta) => {
   return Number((titleScore * 0.55 + artistScore * 0.3 + durScore * 0.15).toFixed(3));
 };
 
-// ---- 歌词工具（双语合并与 KRC/Base64 解码） ----
+// ---- 歌词工具（双语合并） ----
 
 const parseLrcLinesToMap = (lrcText) => {
   const map = new Map();
@@ -220,7 +272,10 @@ const extractUrlsFromSongUrlResponse = (payload) => {
 };
 
 const parseFilenameTitleArtist = (fileName) => {
-  const base = String(fileName || '').replace(/\.[^.]+$/, '').replace(/^\d+\s*[.\-_]\s*/, '').trim();
+  const base = String(fileName || '')
+    .replace(/\.[^.]+$/, '')
+    .replace(/^\d+\s*[.\-_]\s*/, '')
+    .trim();
   const sepIdx = base.indexOf(' - ');
   if (sepIdx > 0 && sepIdx < base.length - 3) {
     return {
@@ -237,24 +292,94 @@ const getFsGrantApi = (ctx) => {
   return null;
 };
 
+const normalizePinnedEntry = (trackKey, raw) => {
+  if (!raw || typeof raw !== 'object') return null;
+  const now = Date.now();
+  return {
+    trackKey,
+    targetTitle: String(raw.targetTitle ?? raw.title ?? '').trim(),
+    targetArtist: String(raw.targetArtist ?? raw.artist ?? '').trim(),
+    targetAlbum: String(raw.targetAlbum ?? '').trim(),
+    targetDuration: Number(raw.targetDuration) || 0,
+    channel: String(raw.channel || 'external'),
+    provider: String(raw.provider || ''),
+    sourcePlatform: String(raw.sourcePlatform || ''),
+    externalId: String(raw.externalId || ''),
+    lyricId: String(raw.lyricId || ''),
+    hash: String(raw.hash || ''),
+    fallbackHashes: Array.isArray(raw.fallbackHashes) ? raw.fallbackHashes.filter(Boolean) : [],
+    localItem:
+      raw.localItem && typeof raw.localItem === 'object'
+        ? {
+            name: String(raw.localItem.name || ''),
+            path: String(raw.localItem.path || ''),
+            baseKey: String(raw.localItem.baseKey || ''),
+            folderName: String(raw.localItem.folderName || ''),
+            ext: String(raw.localItem.ext || ''),
+            quality: String(raw.localItem.quality || ''),
+          }
+        : null,
+    quality: String(raw.quality || '320'),
+    ext: String(raw.ext || (raw.quality === 'flac' ? 'flac' : 'mp3')),
+    channelLabel: String(raw.channelLabel || CHANNEL_META[raw.channel]?.label || '锁定音源'),
+    title: String(raw.title ?? raw.targetTitle ?? '').trim(),
+    artist: String(raw.artist ?? raw.targetArtist ?? '').trim(),
+    album: String(raw.album ?? '').trim(),
+    duration: Number(raw.duration) || 0,
+    url: String(raw.url || '').trim(),
+    urlCachedAt: Number(raw.urlCachedAt ?? raw.updatedAt ?? now) || now,
+    updatedAt: Number(raw.updatedAt ?? now) || now,
+  };
+};
+
+const formatPinnedDescriptorHint = (entry) => {
+  if (!entry) return '';
+  if (entry.channel === 'local') {
+    const folder = entry.localItem?.folderName || '本地目录';
+    const fileName = entry.localItem?.name || entry.title;
+    return fileName ? `${folder} · ${fileName}` : folder;
+  }
+  if (entry.channel === 'kugou-alt') {
+    return entry.hash ? `酷狗异版 · ${entry.hash.slice(0, 8)}` : '酷狗同曲异版';
+  }
+  const parts = [];
+  if (entry.provider === 'gdstudio') parts.push('GDStudio');
+  else if (entry.provider === 'netease-direct') parts.push('NetEase');
+  else if (entry.sourcePlatform === 'custom') parts.push('自定义 API');
+  if (entry.sourcePlatform && entry.sourcePlatform !== 'custom') {
+    parts.push(entry.sourcePlatform.toUpperCase());
+  }
+  if (entry.externalId) parts.push(`#${entry.externalId}`);
+  return parts.join(' · ') || entry.channelLabel || '外部音源';
+};
+
 // ---- 核心状态与解灰引擎 ----
 
 const createUnblockEngine = (ctx) => {
   const { reactive } = ctx.vue;
+  let scanSeq = 0;
 
   const state = reactive({
-    settings: { ...DEFAULT_SETTINGS, localFolders: [] },
+    settings: {
+      ...DEFAULT_SETTINGS,
+      preferredExternalSources: [...DEFAULT_SETTINGS.preferredExternalSources],
+      localFolders: [],
+    },
     pinned: {},
+    sessionOverrides: {},
     history: [],
     localIndex: [],
     localLyricIndex: new Map(),
     localScanning: false,
     activeTrackStatus: null,
     dialogOpen: false,
+    modalTargetTrack: null,
+    candidatesTrackKey: '',
     scanningCandidates: false,
     candidates: [],
     testingApi: false,
     testApiResult: '',
+    testApiOk: null,
   });
 
   const saveSettings = async (patch = {}) => {
@@ -285,6 +410,14 @@ const createUnblockEngine = (ctx) => {
     } catch {}
   };
 
+  const clearHistory = async () => {
+    state.history = [];
+    try {
+      await ctx.storage.set(STORAGE_HISTORY, []);
+    } catch {}
+    ctx.toast?.info?.('已清空解灰记录');
+  };
+
   // 扫描本地授权文件夹索引
   const rebuildLocalIndex = async () => {
     if (state.localScanning) return state.localIndex;
@@ -299,7 +432,12 @@ const createUnblockEngine = (ctx) => {
           const grants = await fsGrants.listDirectoryGrants();
           if (Array.isArray(grants)) {
             for (const g of grants) {
-              if (g && g.id && g.available !== false && !folders.some((f) => f.id === g.id || (g.displayPath && f.path === g.displayPath))) {
+              if (
+                g &&
+                g.id &&
+                g.available !== false &&
+                !folders.some((f) => f.id === g.id || (g.displayPath && f.path === g.displayPath))
+              ) {
                 folders.push({
                   id: g.id,
                   name: g.name || '已授权目录',
@@ -315,9 +453,7 @@ const createUnblockEngine = (ctx) => {
       const ingestFileEntries = (files, folderName, ownerBridge = null) => {
         if (!Array.isArray(files)) return;
         for (const file of files) {
-          const ext = String(
-            file.extension || file.name?.match(/\.[^.]+$/)?.[0] || '',
-          ).toLowerCase();
+          const ext = String(file.extension || file.name?.match(/\.[^.]+$/)?.[0] || '').toLowerCase();
           const baseKey = String(file.name || '')
             .replace(/\.[^.]+$/, '')
             .toLowerCase()
@@ -349,7 +485,6 @@ const createUnblockEngine = (ctx) => {
         }
       };
 
-      // 自动复用 echo-music-download 跨插件桥中的已下载目录文件
       const dlBridge = globalThis.__echoMusicDownload;
       if (dlBridge && typeof dlBridge.listLocalFiles === 'function') {
         try {
@@ -434,6 +569,8 @@ const createUnblockEngine = (ctx) => {
         channelLabel: `本地曲库 (${item.folderName})`,
         title: item.title || item.name,
         artist: item.artist || songMeta.artist,
+        album: item.folderName || '',
+        duration: 0,
         quality: item.quality,
         ext: item.ext,
         score,
@@ -466,14 +603,19 @@ const createUnblockEngine = (ctx) => {
         const candArtist = String(
           item?.SingerName ??
             item?.singername ??
-            (Array.isArray(item?.Singers) ? item.Singers.map((s) => s?.name).filter(Boolean).join(' / ') : ''),
+            (Array.isArray(item?.Singers)
+              ? item.Singers.map((s) => s?.name).filter(Boolean).join(' / ')
+              : ''),
         ).trim();
         const candAlbum = String(item?.AlbumName ?? item?.album_name ?? '').trim();
         const candDur = Number(item?.Duration ?? item?.duration ?? 0);
         const hash320 = String(item?.HQFileHash ?? item?.HQ?.Hash ?? '').trim();
         const hashFlac = String(item?.SQFileHash ?? item?.SQ?.Hash ?? '').trim();
         const hash128 = String(item?.FileHash ?? item?.filehash ?? item?.hash ?? '').trim();
-        const primaryHash = (preferredQuality === 'flac' && hashFlac) || (preferredQuality !== '128' && hash320) || hash128;
+        const primaryHash =
+          (preferredQuality === 'flac' && hashFlac) ||
+          (preferredQuality !== '128' && hash320) ||
+          hash128;
         if (!primaryHash || primaryHash.toLowerCase() === currentHash) continue;
 
         const score = scoreCandidate(songMeta, {
@@ -564,6 +706,67 @@ const createUnblockEngine = (ctx) => {
     return null;
   };
 
+  const buildCustomApiRequestUrl = (template, songMeta, preferredQuality = '320') => {
+    const keyword = [songMeta.title, songMeta.artist].filter(Boolean).join(' ').trim();
+    return String(template || '')
+      .trim()
+      .replace(/\{title\}/gi, encodeURIComponent(songMeta.title || ''))
+      .replace(/\{artist\}/gi, encodeURIComponent(songMeta.artist || ''))
+      .replace(/\{album\}/gi, encodeURIComponent(songMeta.album || ''))
+      .replace(/\{keyword\}/gi, encodeURIComponent(keyword))
+      .replace(/\{quality\}/gi, encodeURIComponent(preferredQuality || '320'))
+      .replace(/\{hash\}/gi, encodeURIComponent(songMeta.hash || ''));
+  };
+
+  const testCustomApi = async (templateOverride) => {
+    const template = String(
+      templateOverride !== undefined ? templateOverride : state.settings.customApiUrl || '',
+    ).trim();
+    if (!template) {
+      state.testApiOk = false;
+      state.testApiResult = '请先填写自定义音源 API 模板 URL';
+      return { ok: false, message: state.testApiResult };
+    }
+    if (!/^https?:\/\//i.test(template)) {
+      state.testApiOk = false;
+      state.testApiResult = 'URL 需以 http:// 或 https:// 开头';
+      return { ok: false, message: state.testApiResult };
+    }
+    state.testingApi = true;
+    state.testApiResult = '正在测试连通性…';
+    state.testApiOk = null;
+    const started = Date.now();
+    try {
+      const builtUrl = buildCustomApiRequestUrl(
+        template,
+        { title: '稻香', artist: '周杰伦', album: '魔杰座', hash: 'test' },
+        '320',
+      );
+      const data = await netFetchJson(builtUrl, { timeoutMs: 7000 });
+      const latency = Date.now() - started;
+      const urls = extractUrlsFromSongUrlResponse(data);
+      if (urls.length > 0) {
+        state.testApiOk = true;
+        state.testApiResult = `连通成功 · 返回 ${urls.length} 条音频直链 (${latency}ms)`;
+        return { ok: true, message: state.testApiResult, urls, latencyMs: latency };
+      }
+      if (data !== null) {
+        state.testApiOk = false;
+        state.testApiResult = `接口已响应 (${latency}ms)，但未解析到可用音频 URL 字段`;
+        return { ok: false, message: state.testApiResult, latencyMs: latency };
+      }
+      state.testApiOk = false;
+      state.testApiResult = `连接失败或响应超时 (${latency}ms)`;
+      return { ok: false, message: state.testApiResult, latencyMs: latency };
+    } catch (err) {
+      state.testApiOk = false;
+      state.testApiResult = `请求异常：${err?.message || '网络不可达'}`;
+      return { ok: false, message: state.testApiResult };
+    } finally {
+      state.testingApi = false;
+    }
+  };
+
   const findExternalApiCandidates = async (songMeta, preferredQuality = '320') => {
     const results = [];
     const customTemplate = String(state.settings.customApiUrl || '').trim();
@@ -573,13 +776,7 @@ const createUnblockEngine = (ctx) => {
     // 3A. 用户自定义音源接口模板
     if (customTemplate) {
       try {
-        const builtUrl = customTemplate
-          .replace(/\{title\}/gi, encodeURIComponent(songMeta.title || ''))
-          .replace(/\{artist\}/gi, encodeURIComponent(songMeta.artist || ''))
-          .replace(/\{album\}/gi, encodeURIComponent(songMeta.album || ''))
-          .replace(/\{keyword\}/gi, encodeURIComponent(keyword))
-          .replace(/\{quality\}/gi, encodeURIComponent(preferredQuality || '320'))
-          .replace(/\{hash\}/gi, encodeURIComponent(songMeta.hash || ''));
+        const builtUrl = buildCustomApiRequestUrl(customTemplate, songMeta, preferredQuality);
         const data = await netFetchJson(builtUrl, { timeoutMs: 7000 });
         const urls = extractUrlsFromSongUrlResponse(data);
         if (urls.length > 0) {
@@ -587,9 +784,12 @@ const createUnblockEngine = (ctx) => {
             id: `external:custom:${urls[0]}`,
             channel: 'external',
             channelLabel: '自定义音源 API',
+            provider: 'custom',
             sourcePlatform: 'custom',
             title: songMeta.title,
             artist: songMeta.artist,
+            album: songMeta.album || '',
+            duration: songMeta.duration || 0,
             quality: preferredQuality === 'flac' ? 'flac' : '320',
             url: urls[0],
             urls,
@@ -601,11 +801,14 @@ const createUnblockEngine = (ctx) => {
       }
     }
 
-    // 3B. GDStudio 多平台音源接口 (netease / kuwo / tencent)
-    const platforms = Array.isArray(state.settings.preferredExternalSources) && state.settings.preferredExternalSources.length
-      ? state.settings.preferredExternalSources
-      : ['netease', 'kuwo'];
-    for (const source of platforms.slice(0, 2)) {
+    // 3B. GDStudio 多平台音源接口 (按用户配置的平台优先级顺序)
+    const platforms =
+      Array.isArray(state.settings.preferredExternalSources) &&
+      state.settings.preferredExternalSources.length
+        ? state.settings.preferredExternalSources
+        : ['netease', 'kuwo'];
+    for (let idx = 0; idx < Math.min(platforms.length, 3); idx += 1) {
+      const source = platforms[idx];
       try {
         const searchUrl = `https://music-api.gdstudio.xyz/api.php?types=search&source=${encodeURIComponent(source)}&name=${encodeURIComponent(keyword)}&count=6&pages=1`;
         const list = await netFetchJson(searchUrl, { timeoutMs: 6500 });
@@ -617,8 +820,15 @@ const createUnblockEngine = (ctx) => {
               : String(item?.artist ?? '').trim();
             const trackId = String(item?.id ?? item?.url_id ?? '').trim();
             if (!trackId || !candTitle) continue;
-            const score = scoreCandidate(songMeta, { title: candTitle, artist: candArtist, duration: 0 });
+            const rawDur = Number(item?.duration ?? 0);
+            const candDur = rawDur > 10000 ? Math.round(rawDur / 1000) : Math.round(rawDur);
+            const score = scoreCandidate(songMeta, {
+              title: candTitle,
+              artist: candArtist,
+              duration: candDur,
+            });
             if (score < 0.65) continue;
+            const priorityBoost = Math.max(0, (2 - idx) * 0.015);
             results.push({
               id: `external:gdstudio:${source}:${trackId}`,
               channel: 'external',
@@ -630,8 +840,9 @@ const createUnblockEngine = (ctx) => {
               title: candTitle,
               artist: candArtist,
               album: String(item?.album ?? ''),
+              duration: candDur,
               quality: preferredQuality === 'flac' ? 'flac' : '320',
-              score,
+              score: Math.min(1, Number((score + priorityBoost).toFixed(3))),
             });
           }
         }
@@ -639,54 +850,75 @@ const createUnblockEngine = (ctx) => {
     }
 
     // 3C. 网易云官方搜索 + 外链直通兜底
-    try {
-      const neSearchUrl = `https://music.163.com/api/search/get/web?s=${encodeURIComponent(keyword)}&type=1&offset=0&total=true&limit=6`;
-      const neRes = await netFetchJson(neSearchUrl, {
-        headers: { Referer: 'https://music.163.com/' },
-        timeoutMs: 6000,
-      });
-      const songs = neRes?.result?.songs;
-      if (Array.isArray(songs)) {
-        for (const item of songs) {
-          const candTitle = String(item?.name ?? '').trim();
-          const candArtist = Array.isArray(item?.artists)
-            ? item.artists.map((a) => a?.name).filter(Boolean).join(' / ')
-            : '';
-          const candDur = item?.duration ? Math.round(Number(item.duration) / 1000) : 0;
-          const songId = String(item?.id ?? '').trim();
-          if (!songId || !candTitle) continue;
-          const score = scoreCandidate(songMeta, {
-            title: candTitle,
-            artist: candArtist,
-            duration: candDur,
-          });
-          if (score < 0.66) continue;
-          results.push({
-            id: `external:netease:${songId}`,
-            channel: 'external',
-            channelLabel: '外部音源 (NetEase)',
-            sourcePlatform: 'netease',
-            provider: 'netease-direct',
-            externalId: songId,
-            lyricId: songId,
-            title: candTitle,
-            artist: candArtist,
-            album: String(item?.album?.name ?? ''),
-            duration: candDur,
-            quality: '320',
-            score,
-          });
+    if (platforms.includes('netease') || results.length === 0) {
+      try {
+        const neSearchUrl = `https://music.163.com/api/search/get/web?s=${encodeURIComponent(keyword)}&type=1&offset=0&total=true&limit=6`;
+        const neRes = await netFetchJson(neSearchUrl, {
+          headers: { Referer: 'https://music.163.com/' },
+          timeoutMs: 6000,
+        });
+        const songs = neRes?.result?.songs;
+        if (Array.isArray(songs)) {
+          for (const item of songs) {
+            const candTitle = String(item?.name ?? '').trim();
+            const candArtist = Array.isArray(item?.artists)
+              ? item.artists.map((a) => a?.name).filter(Boolean).join(' / ')
+              : '';
+            const candDur = item?.duration ? Math.round(Number(item.duration) / 1000) : 0;
+            const songId = String(item?.id ?? '').trim();
+            if (!songId || !candTitle) continue;
+            const score = scoreCandidate(songMeta, {
+              title: candTitle,
+              artist: candArtist,
+              duration: candDur,
+            });
+            if (score < 0.66) continue;
+            results.push({
+              id: `external:netease:${songId}`,
+              channel: 'external',
+              channelLabel: '外部音源 (NetEase)',
+              sourcePlatform: 'netease',
+              provider: 'netease-direct',
+              externalId: songId,
+              lyricId: songId,
+              title: candTitle,
+              artist: candArtist,
+              album: String(item?.album?.name ?? ''),
+              duration: candDur,
+              quality: '320',
+              score,
+            });
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
 
     results.sort((a, b) => b.score - a.score);
-    return results.slice(0, 6);
+    return results.slice(0, 8);
   };
 
-  const resolveExternalCandidateUrl = async (cand, preferredQuality = '320') => {
-    if (cand.url) {
+  const resolveExternalCandidateUrl = async (cand, preferredQuality = '320', { bypassCachedUrl = false } = {}) => {
+    if (!bypassCachedUrl && cand.url) {
       return { url: cand.url, urls: cand.urls || [cand.url], quality: cand.quality || '320' };
+    }
+    if (cand.sourcePlatform === 'custom' && state.settings.customApiUrl) {
+      try {
+        const builtUrl = buildCustomApiRequestUrl(
+          state.settings.customApiUrl,
+          {
+            title: cand.targetTitle || cand.title || '',
+            artist: cand.targetArtist || cand.artist || '',
+            album: cand.targetAlbum || cand.album || '',
+            hash: cand.hash || '',
+          },
+          preferredQuality,
+        );
+        const data = await netFetchJson(builtUrl, { timeoutMs: 7000 });
+        const urls = extractUrlsFromSongUrlResponse(data);
+        if (urls.length > 0) {
+          return { url: urls[0], urls, quality: preferredQuality === 'flac' ? 'flac' : '320' };
+        }
+      } catch {}
     }
     if (cand.provider === 'gdstudio' && cand.externalId) {
       const br = preferredQuality === 'flac' ? '999' : '320';
@@ -702,7 +934,6 @@ const createUnblockEngine = (ctx) => {
       }
     }
     if (cand.sourcePlatform === 'netease' && cand.externalId) {
-      // Meting 公共解析兜底
       try {
         const metingUrl = `https://api.i-meto.com/meting/api?server=netease&type=url&id=${encodeURIComponent(cand.externalId)}`;
         if (typeof ctx.net?.fetch === 'function') {
@@ -714,7 +945,11 @@ const createUnblockEngine = (ctx) => {
             timeoutMs: 6500,
           });
           const finalUrl = String(res?.url || '').trim();
-          if (/^https?:\/\//i.test(finalUrl) && !finalUrl.includes('api.i-meto.com') && !finalUrl.endsWith('/404')) {
+          if (
+            /^https?:\/\//i.test(finalUrl) &&
+            !finalUrl.includes('api.i-meto.com') &&
+            !finalUrl.endsWith('/404')
+          ) {
             return { url: finalUrl, urls: [finalUrl], quality: '320' };
           }
         }
@@ -723,7 +958,150 @@ const createUnblockEngine = (ctx) => {
     return null;
   };
 
-  // 全通道扫描候选列表（用于手动换源诊断弹窗 & 自动解灰瀑布流）
+  // 按持久化描述符解析/刷新锁定音源（过期直链自动按需刷新）
+  const resolvePinnedDescriptor = async (pinned, songMeta, preferredQuality = '320', { forceRefresh = false } = {}) => {
+    if (!pinned) return null;
+    const now = Date.now();
+    const cachedAt = Number(pinned.urlCachedAt ?? pinned.updatedAt ?? 0) || 0;
+    const isExpired = !pinned.url || now - cachedAt > PINNED_URL_TTL_MS;
+
+    // 1. 本地曲库锁定源：重新定位本地索引以获取有效的媒体租约 URL
+    if (pinned.channel === 'local') {
+      if (!state.localIndex.length && (state.settings.localFolders?.length > 0 || globalThis.__echoMusicDownload)) {
+        await rebuildLocalIndex();
+      }
+      const targetPath = pinned.localItem?.path || '';
+      const targetName = pinned.localItem?.name || '';
+      const targetBaseKey = pinned.localItem?.baseKey || '';
+      const matched =
+        state.localIndex.find(
+          (it) =>
+            (targetPath && it.path === targetPath) ||
+            (targetName && it.name === targetName) ||
+            (targetBaseKey && it.baseKey === targetBaseKey),
+        ) || null;
+      if (matched) {
+        const freshUrl = await resolveLocalFilePlayUrl(matched);
+        if (freshUrl) {
+          pinned.url = freshUrl;
+          pinned.urlCachedAt = now;
+          pinned.quality = matched.quality || pinned.quality || '320';
+          pinned.ext = matched.ext || pinned.ext || 'mp3';
+          void savePinned();
+          return {
+            url: freshUrl,
+            urls: [freshUrl],
+            quality: pinned.quality,
+            ext: pinned.ext,
+            baseKey: matched.baseKey || targetBaseKey,
+            refreshed: true,
+          };
+        }
+      }
+      if (pinned.url) {
+        return {
+          url: pinned.url,
+          urls: [pinned.url],
+          quality: pinned.quality || '320',
+          ext: pinned.ext || 'mp3',
+          baseKey: targetBaseKey,
+          refreshed: false,
+        };
+      }
+      return null;
+    }
+
+    // 2. 酷狗同曲异版锁定源：按 hash 刷新过期直链
+    if (pinned.channel === 'kugou-alt') {
+      if ((forceRefresh || isExpired) && (pinned.hash || pinned.fallbackHashes?.length)) {
+        const refreshed = await resolveKugouCandidateUrl(
+          {
+            hash: pinned.hash,
+            fallbackHashes: pinned.fallbackHashes || [],
+            quality: pinned.quality,
+          },
+          preferredQuality || pinned.quality || '320',
+        );
+        if (refreshed?.url) {
+          pinned.url = refreshed.url;
+          pinned.hash = refreshed.hash || pinned.hash;
+          pinned.quality = refreshed.quality || pinned.quality;
+          pinned.ext = pinned.quality === 'flac' ? 'flac' : 'mp3';
+          pinned.urlCachedAt = now;
+          void savePinned();
+          return {
+            url: refreshed.url,
+            urls: refreshed.urls || [refreshed.url],
+            quality: pinned.quality,
+            ext: pinned.ext,
+            refreshed: true,
+          };
+        }
+      }
+      if (pinned.url) {
+        return {
+          url: pinned.url,
+          urls: [pinned.url],
+          quality: pinned.quality || '320',
+          ext: pinned.ext || (pinned.quality === 'flac' ? 'flac' : 'mp3'),
+          refreshed: false,
+        };
+      }
+      return null;
+    }
+
+    // 3. 外部平台锁定源：按 provider / sourcePlatform / externalId 按需刷新直链
+    if (forceRefresh || isExpired) {
+      const canRefresh = Boolean(
+        pinned.externalId || (pinned.sourcePlatform === 'custom' && state.settings.customApiUrl),
+      );
+      if (canRefresh) {
+        const refreshed = await resolveExternalCandidateUrl(
+          {
+            provider: pinned.provider,
+            sourcePlatform: pinned.sourcePlatform,
+            externalId: pinned.externalId,
+            quality: pinned.quality,
+            title: pinned.title || songMeta?.title || '',
+            artist: pinned.artist || songMeta?.artist || '',
+            targetTitle: pinned.targetTitle || songMeta?.title || '',
+            targetArtist: pinned.targetArtist || songMeta?.artist || '',
+            targetAlbum: pinned.targetAlbum || songMeta?.album || '',
+            hash: pinned.hash || songMeta?.hash || '',
+          },
+          preferredQuality || pinned.quality || '320',
+          { bypassCachedUrl: true },
+        );
+        if (refreshed?.url) {
+          pinned.url = refreshed.url;
+          pinned.quality = refreshed.quality || pinned.quality || '320';
+          pinned.ext = pinned.quality === 'flac' ? 'flac' : 'mp3';
+          pinned.urlCachedAt = now;
+          void savePinned();
+          return {
+            url: refreshed.url,
+            urls: refreshed.urls || [refreshed.url],
+            quality: pinned.quality,
+            ext: pinned.ext,
+            refreshed: true,
+          };
+        }
+      }
+    }
+
+    if (pinned.url) {
+      return {
+        url: pinned.url,
+        urls: [pinned.url],
+        quality: pinned.quality || '320',
+        ext: pinned.ext || (pinned.quality === 'flac' ? 'flac' : 'mp3'),
+        refreshed: false,
+      };
+    }
+    return null;
+  };
+
+  // 全通道扫描候选列表（用于手动换源弹窗 & 诊断）
   const scanAllCandidates = async (song, preferredQuality = '320') => {
     const songMeta = extractSongMeta(song);
     if (!songMeta.title) return [];
@@ -733,6 +1111,53 @@ const createUnblockEngine = (ctx) => {
       state.settings.enableExternalApi ? findExternalApiCandidates(songMeta, preferredQuality) : Promise.resolve([]),
     ]);
     return [...localList, ...kugouList, ...extList];
+  };
+
+  // 带目标曲目隔离与防竞态保护的候选扫描
+  const scanCandidatesFor = async (song, preferredQuality = 'flac') => {
+    const key = getTrackKey(song);
+    if (!song || !key) {
+      state.candidates = [];
+      state.candidatesTrackKey = '';
+      state.scanningCandidates = false;
+      return [];
+    }
+    const reqId = ++scanSeq;
+    if (state.candidatesTrackKey !== key) {
+      state.candidates = [];
+      state.candidatesTrackKey = key;
+    }
+    state.scanningCandidates = true;
+    try {
+      const list = await scanAllCandidates(song, preferredQuality);
+      if (reqId === scanSeq) {
+        state.candidates = list;
+        state.candidatesTrackKey = key;
+      }
+      return list;
+    } finally {
+      if (reqId === scanSeq) {
+        state.scanningCandidates = false;
+      }
+    }
+  };
+
+  const openSwitcherForTrack = async (targetTrack, { forceScan = true } = {}) => {
+    const track = targetTrack || ctx.player?.currentTrack?.value || null;
+    if (!track) {
+      ctx.toast?.info?.('当前没有可换源的歌曲');
+      return;
+    }
+    const key = getTrackKey(track);
+    state.modalTargetTrack = track;
+    if (key !== state.candidatesTrackKey) {
+      state.candidates = [];
+      state.candidatesTrackKey = key;
+    }
+    state.dialogOpen = true;
+    if (forceScan || state.candidates.length === 0) {
+      await scanCandidatesFor(track, 'flac');
+    }
   };
 
   const materializeCandidate = async (cand, preferredQuality = '320') => {
@@ -780,25 +1205,70 @@ const createUnblockEngine = (ctx) => {
     const trackKey = getTrackKey(song);
     const songMeta = extractSongMeta(song);
     if (!songMeta.title) return null;
+    const isDownloadStage = stage === 'download-fallback';
 
-    // 1. 检查手动锁定音源
-    const pinned = trackKey ? state.pinned[trackKey] : null;
-    if (pinned && pinned.url) {
-      state.activeTrackStatus = {
-        trackKey,
-        channel: 'pinned',
-        label: pinned.channelLabel || '手动锁定源',
-        quality: pinned.quality || preferredQuality,
-        matchedTitle: pinned.title || songMeta.title,
-        matchedArtist: pinned.artist || songMeta.artist,
-        url: pinned.url,
-      };
+    // 0. 检查当前会话临时试听覆盖（仅本次试听 / 指定下载候选）
+    const sessionOverride = trackKey ? state.sessionOverrides[trackKey] : null;
+    if (sessionOverride && sessionOverride.url) {
+      if (!isDownloadStage) {
+        state.activeTrackStatus = {
+          trackKey,
+          channel: sessionOverride.channel || 'external',
+          label: `试听 · ${sessionOverride.channelLabel || '临时音源'}`,
+          quality: sessionOverride.quality || preferredQuality,
+          matchedTitle: sessionOverride.title || songMeta.title,
+          matchedArtist: sessionOverride.artist || songMeta.artist,
+          matchedHash: sessionOverride.hash || '',
+          externalId: sessionOverride.externalId || '',
+          lyricId: sessionOverride.lyricId || '',
+          sourcePlatform: sessionOverride.sourcePlatform || '',
+          baseKey: sessionOverride.baseKey || '',
+          url: sessionOverride.url,
+          isTemporary: true,
+        };
+      }
       return {
-        url: pinned.url,
-        urls: [pinned.url],
-        quality: pinned.quality || '320',
+        url: sessionOverride.url,
+        urls: sessionOverride.urls || [sessionOverride.url],
+        quality: sessionOverride.quality || '320',
+        ext: sessionOverride.ext || (sessionOverride.quality === 'flac' ? 'flac' : 'mp3'),
         sourceKind: 'plugin',
+        channel: sessionOverride.channel || 'external',
+        channelLabel: sessionOverride.channelLabel || '临时音源',
       };
+    }
+
+    // 1. 检查持久化锁定音源（支持按描述符自动刷新过期直链）
+    const pinned = trackKey ? state.pinned[trackKey] : null;
+    if (pinned) {
+      const resolvedPinned = await resolvePinnedDescriptor(pinned, songMeta, preferredQuality);
+      if (resolvedPinned?.url) {
+        if (!isDownloadStage) {
+          state.activeTrackStatus = {
+            trackKey,
+            channel: 'pinned',
+            label: pinned.channelLabel || '手动锁定源',
+            quality: resolvedPinned.quality || preferredQuality,
+            matchedTitle: pinned.title || songMeta.title,
+            matchedArtist: pinned.artist || songMeta.artist,
+            matchedHash: pinned.hash || '',
+            externalId: pinned.externalId || '',
+            lyricId: pinned.lyricId || '',
+            sourcePlatform: pinned.sourcePlatform || '',
+            baseKey: resolvedPinned.baseKey || pinned.localItem?.baseKey || '',
+            url: resolvedPinned.url,
+          };
+        }
+        return {
+          url: resolvedPinned.url,
+          urls: resolvedPinned.urls || [resolvedPinned.url],
+          quality: resolvedPinned.quality || '320',
+          ext: resolvedPinned.ext || (resolvedPinned.quality === 'flac' ? 'flac' : 'mp3'),
+          sourceKind: 'plugin',
+          channel: 'pinned',
+          channelLabel: pinned.channelLabel || '手动锁定源',
+        };
+      }
     }
 
     // before-catalog 阶段仅当开启 localPriority 时匹配本地曲库
@@ -823,6 +1293,10 @@ const createUnblockEngine = (ctx) => {
             trackKey,
             title: songMeta.title,
             artist: songMeta.artist,
+            album: songMeta.album,
+            duration: songMeta.duration,
+            hash: songMeta.hash,
+            id: songMeta.id,
             channel: 'local',
             channelLabel: mat.channelLabel,
             quality: mat.quality,
@@ -831,6 +1305,7 @@ const createUnblockEngine = (ctx) => {
             url: mat.url,
             urls: mat.urls,
             quality: mat.quality,
+            ext: mat.ext || 'mp3',
             sourceKind: 'plugin',
           };
         }
@@ -854,24 +1329,30 @@ const createUnblockEngine = (ctx) => {
       for (const cand of group) {
         const mat = await materializeCandidate(cand, preferredQuality);
         if (mat?.url) {
-          state.activeTrackStatus = {
-            trackKey,
-            channel: mat.channel,
-            label: mat.channelLabel,
-            quality: mat.quality,
-            matchedTitle: mat.title,
-            matchedArtist: mat.artist,
-            matchedHash: mat.hash || '',
-            externalId: mat.externalId || '',
-            lyricId: mat.lyricId || '',
-            sourcePlatform: mat.sourcePlatform || '',
-            baseKey: cand.localItem?.baseKey || '',
-            url: mat.url,
-          };
+          if (!isDownloadStage) {
+            state.activeTrackStatus = {
+              trackKey,
+              channel: mat.channel,
+              label: mat.channelLabel,
+              quality: mat.quality,
+              matchedTitle: mat.title,
+              matchedArtist: mat.artist,
+              matchedHash: mat.hash || '',
+              externalId: mat.externalId || '',
+              lyricId: mat.lyricId || '',
+              sourcePlatform: mat.sourcePlatform || '',
+              baseKey: cand.localItem?.baseKey || '',
+              url: mat.url,
+            };
+          }
           void recordHistory({
             trackKey,
             title: songMeta.title,
             artist: songMeta.artist,
+            album: songMeta.album,
+            duration: songMeta.duration,
+            hash: songMeta.hash,
+            id: songMeta.id,
             channel: mat.channel,
             channelLabel: mat.channelLabel,
             quality: mat.quality,
@@ -932,7 +1413,11 @@ const createUnblockEngine = (ctx) => {
 
     // 2. 酷狗异版匹配到的歌曲 Hash 歌词
     const candidateHash = activeStatus?.matchedHash || songMeta.hash;
-    if (candidateHash && typeof ctx.kugou?.music?.searchLyric === 'function' && typeof ctx.kugou?.music?.getLyric === 'function') {
+    if (
+      candidateHash &&
+      typeof ctx.kugou?.music?.searchLyric === 'function' &&
+      typeof ctx.kugou?.music?.getLyric === 'function'
+    ) {
       try {
         const searchRes = await ctx.kugou.music.searchLyric(candidateHash, {
           duration: songMeta.duration ? songMeta.duration * 1000 : undefined,
@@ -1006,54 +1491,260 @@ const createUnblockEngine = (ctx) => {
     return null;
   };
 
-  // 手动应用并锁定候选音源
-  const applyAndPinCandidate = async (song, cand) => {
+  const isTargetCurrentPlaying = (song, trackKey) => {
+    const current = ctx.player?.currentTrack?.value;
+    if (!current) return false;
+    const currentKey = getTrackKey(current);
+    if (currentKey && trackKey && currentKey === trackKey) return true;
+    const currentId = String(ctx.player?.currentTrackId?.value ?? '').trim();
+    const meta = extractSongMeta(song);
+    return Boolean(currentId && meta.id && currentId === meta.id);
+  };
+
+  const triggerPlaybackForTarget = async (song, trackKey, { playIfNotCurrent = false } = {}) => {
+    try {
+      const currentId = ctx.player?.currentTrackId?.value;
+      if (isTargetCurrentPlaying(song, trackKey) && currentId && typeof ctx.player?.playTrack === 'function') {
+        await ctx.player.playTrack(currentId, { autoPlay: true });
+        return;
+      }
+      if (playIfNotCurrent) {
+        if (typeof ctx.player?.playSong === 'function') {
+          await ctx.player.playSong(song);
+          return;
+        }
+        const meta = extractSongMeta(song);
+        if (meta.id && typeof ctx.player?.playTrack === 'function') {
+          await ctx.player.playTrack(meta.id, { autoPlay: true });
+        }
+      }
+    } catch {}
+  };
+
+  // 仅本次试听（不写入持久化锁定）
+  const applyTemporaryCandidate = async (song, cand) => {
     const trackKey = getTrackKey(song);
     if (!trackKey) return false;
+    const songMeta = extractSongMeta(song);
     const mat = await materializeCandidate(cand, 'flac');
     if (!mat?.url) {
-      ctx.toast.warning('该候选音源暂不可用，请尝试其他源');
+      ctx.toast?.warning?.('该候选音源暂不可用，请尝试其他源');
       return false;
     }
-    state.pinned[trackKey] = {
+    state.sessionOverrides[trackKey] = {
+      trackKey,
       channel: mat.channel,
+      provider: mat.provider || '',
+      sourcePlatform: mat.sourcePlatform || '',
+      externalId: mat.externalId || '',
+      lyricId: mat.lyricId || '',
+      hash: mat.hash || '',
+      baseKey: mat.localItem?.baseKey || '',
       channelLabel: mat.channelLabel,
       title: mat.title,
       artist: mat.artist,
       quality: mat.quality,
+      ext: mat.ext || (mat.quality === 'flac' ? 'flac' : 'mp3'),
       url: mat.url,
-      hash: mat.hash || '',
+      urls: mat.urls || [mat.url],
       updatedAt: Date.now(),
     };
-    await savePinned();
-    state.activeTrackStatus = {
-      trackKey,
-      channel: 'pinned',
-      label: `锁定 · ${mat.channelLabel}`,
-      quality: mat.quality,
-      matchedTitle: mat.title,
-      matchedArtist: mat.artist,
-      url: mat.url,
-    };
-    ctx.toast.success(`已切换并锁定音源：${mat.channelLabel}`);
-    try {
-      const currentId = ctx.player?.currentTrackId?.value;
-      if (currentId) {
-        await ctx.player.playTrack(currentId, { autoPlay: true });
-      }
-    } catch {}
+    if (isTargetCurrentPlaying(song, trackKey)) {
+      state.activeTrackStatus = {
+        trackKey,
+        channel: mat.channel,
+        label: `试听 · ${mat.channelLabel}`,
+        quality: mat.quality,
+        matchedTitle: mat.title,
+        matchedArtist: mat.artist,
+        matchedHash: mat.hash || '',
+        externalId: mat.externalId || '',
+        lyricId: mat.lyricId || '',
+        sourcePlatform: mat.sourcePlatform || '',
+        baseKey: mat.localItem?.baseKey || '',
+        url: mat.url,
+        isTemporary: true,
+      };
+    }
+    ctx.toast?.success?.(`开始试听「${songMeta.title || mat.title}」· ${mat.channelLabel}`);
+    await triggerPlaybackForTarget(song, trackKey, { playIfNotCurrent: true });
     return true;
   };
 
-  const unpinTrack = async (song) => {
+  // 手动应用并持久化锁定候选音源（完整保存音源描述符以便过期按需刷新）
+  const applyAndPinCandidate = async (song, cand) => {
     const trackKey = getTrackKey(song);
-    if (!trackKey || !state.pinned[trackKey]) return;
+    if (!trackKey) return false;
+    const songMeta = extractSongMeta(song);
+    const mat = await materializeCandidate(cand, 'flac');
+    if (!mat?.url) {
+      ctx.toast?.warning?.('该候选音源暂不可用，请尝试其他源');
+      return false;
+    }
+    const now = Date.now();
+    delete state.sessionOverrides[trackKey];
+    state.pinned[trackKey] = normalizePinnedEntry(trackKey, {
+      trackKey,
+      targetTitle: songMeta.title || mat.title,
+      targetArtist: songMeta.artist || mat.artist,
+      targetAlbum: songMeta.album || '',
+      targetDuration: songMeta.duration || 0,
+      channel: mat.channel,
+      provider: mat.provider || '',
+      sourcePlatform: mat.sourcePlatform || '',
+      externalId: mat.externalId || '',
+      lyricId: mat.lyricId || '',
+      hash: mat.hash || '',
+      fallbackHashes: Array.isArray(mat.fallbackHashes) ? mat.fallbackHashes.slice(0, 4) : [],
+      localItem: mat.localItem
+        ? {
+            name: mat.localItem.name || '',
+            path: mat.localItem.path || '',
+            baseKey: mat.localItem.baseKey || '',
+            folderName: mat.localItem.folderName || '',
+            ext: mat.localItem.ext || '',
+            quality: mat.localItem.quality || '',
+          }
+        : null,
+      quality: mat.quality,
+      ext: mat.ext || (mat.quality === 'flac' ? 'flac' : 'mp3'),
+      channelLabel: mat.channelLabel,
+      title: mat.title,
+      artist: mat.artist,
+      album: mat.album || '',
+      duration: mat.duration || 0,
+      url: mat.url,
+      urlCachedAt: now,
+      updatedAt: now,
+    });
+    await savePinned();
+
+    const isCurrent = isTargetCurrentPlaying(song, trackKey);
+    if (isCurrent) {
+      state.activeTrackStatus = {
+        trackKey,
+        channel: 'pinned',
+        label: `锁定 · ${mat.channelLabel}`,
+        quality: mat.quality,
+        matchedTitle: mat.title,
+        matchedArtist: mat.artist,
+        matchedHash: mat.hash || '',
+        externalId: mat.externalId || '',
+        lyricId: mat.lyricId || '',
+        sourcePlatform: mat.sourcePlatform || '',
+        baseKey: mat.localItem?.baseKey || '',
+        url: mat.url,
+      };
+      ctx.toast?.success?.(`已切换并锁定音源：${mat.channelLabel}`);
+      await triggerPlaybackForTarget(song, trackKey, { playIfNotCurrent: false });
+    } else {
+      ctx.toast?.success?.(
+        `已为「${songMeta.title || mat.title}」锁定音源：${mat.channelLabel}`,
+      );
+    }
+    return true;
+  };
+
+  // 发送候选音源至歌曲下载插件 (globalThis.__echoMusicDownload)
+  const downloadCandidate = async (song, cand) => {
+    const dlBridge = globalThis.__echoMusicDownload;
+    if (!dlBridge) {
+      ctx.toast?.info?.('未检测到「歌曲下载」插件');
+      return false;
+    }
+    const trackKey = getTrackKey(song);
+    const songMeta = extractSongMeta(song);
+    const mat = await materializeCandidate(cand, 'flac');
+    if (!mat?.url) {
+      ctx.toast?.warning?.('该候选音源暂不可用，无法发起下载');
+      return false;
+    }
+    if (trackKey) {
+      state.sessionOverrides[trackKey] = {
+        trackKey,
+        channel: mat.channel,
+        provider: mat.provider || '',
+        sourcePlatform: mat.sourcePlatform || '',
+        externalId: mat.externalId || '',
+        lyricId: mat.lyricId || '',
+        hash: mat.hash || '',
+        baseKey: mat.localItem?.baseKey || '',
+        channelLabel: mat.channelLabel,
+        title: mat.title,
+        artist: mat.artist,
+        quality: mat.quality,
+        ext: mat.ext || (mat.quality === 'flac' ? 'flac' : 'mp3'),
+        url: mat.url,
+        urls: mat.urls || [mat.url],
+        updatedAt: Date.now(),
+      };
+    }
+    const payload = {
+      ...(song && typeof song === 'object' ? song : {}),
+      id: songMeta.id || cand.id,
+      hash: songMeta.hash || cand.hash || `unblock-${Date.now()}`,
+      title: songMeta.title || cand.title,
+      name: songMeta.title || cand.title,
+      artist: songMeta.artist || cand.artist,
+      album: songMeta.album || cand.album || '',
+      duration: songMeta.duration || cand.duration || 0,
+      coverUrl: songMeta.coverUrl || '',
+      url: mat.url,
+      quality: mat.quality,
+      ext: mat.ext,
+      unblockSource: mat,
+    };
+    try {
+      if (typeof dlBridge.enqueueSongs === 'function') {
+        await dlBridge.enqueueSongs([payload]);
+        ctx.toast?.success?.(`已将「${payload.title}」(${mat.channelLabel}) 加入下载队列`);
+        return true;
+      }
+      if (typeof dlBridge.downloadSong === 'function') {
+        await dlBridge.downloadSong(payload);
+        ctx.toast?.success?.(`已将「${payload.title}」(${mat.channelLabel}) 加入下载队列`);
+        return true;
+      }
+      if (typeof dlBridge.enqueue === 'function') {
+        await dlBridge.enqueue(payload);
+        ctx.toast?.success?.(`已将「${payload.title}」(${mat.channelLabel}) 加入下载队列`);
+        return true;
+      }
+      ctx.toast?.info?.(`已预选此音源，请在歌曲右键菜单点击「下载歌曲」即可使用该源下载`);
+      return true;
+    } catch (err) {
+      ctx.toast?.warning?.(`发送到下载队列失败：${err?.message || err}`);
+      return false;
+    }
+  };
+
+  const unpinTrack = async (songOrKey) => {
+    const trackKey = getTrackKey(songOrKey);
+    if (!trackKey || (!state.pinned[trackKey] && !state.sessionOverrides[trackKey])) return false;
     delete state.pinned[trackKey];
+    delete state.sessionOverrides[trackKey];
     await savePinned();
     if (state.activeTrackStatus?.trackKey === trackKey) {
       state.activeTrackStatus = null;
     }
-    ctx.toast.info('已解除当前歌曲的锁定音源');
+    ctx.toast?.info?.('已解除该歌曲的锁定音源');
+    return true;
+  };
+
+  const unpinAllTracks = async () => {
+    const count = Object.keys(state.pinned).length;
+    if (count === 0) return 0;
+    const keys = Object.keys(state.pinned);
+    for (const k of keys) {
+      delete state.pinned[k];
+      delete state.sessionOverrides[k];
+    }
+    await savePinned();
+    if (state.activeTrackStatus?.channel === 'pinned') {
+      state.activeTrackStatus = null;
+    }
+    ctx.toast?.info?.(`已解除全部 ${count} 首歌曲的音源锁定`);
+    return count;
   };
 
   const addLocalFolder = async () => {
@@ -1076,7 +1767,7 @@ const createUnblockEngine = (ctx) => {
             });
             await saveSettings();
             await rebuildLocalIndex();
-            ctx.toast.success(`已添加本地曲库目录：${displayPath}`);
+            ctx.toast?.success?.(`已添加本地曲库目录：${displayPath}`);
           }
           return;
         }
@@ -1093,7 +1784,7 @@ const createUnblockEngine = (ctx) => {
           });
           await saveSettings();
           await rebuildLocalIndex();
-          ctx.toast.success(`已添加本地曲库目录：${p}`);
+          ctx.toast?.success?.(`已添加本地曲库目录：${p}`);
         }
       }
     }
@@ -1105,6 +1796,7 @@ const createUnblockEngine = (ctx) => {
     );
     await saveSettings();
     await rebuildLocalIndex();
+    ctx.toast?.info?.('已移除本地曲库目录');
   };
 
   const restore = async () => {
@@ -1112,12 +1804,26 @@ const createUnblockEngine = (ctx) => {
       const savedSettings = await ctx.storage.get(STORAGE_SETTINGS);
       if (savedSettings && typeof savedSettings === 'object') {
         Object.assign(state.settings, DEFAULT_SETTINGS, savedSettings);
+        if (
+          !Array.isArray(state.settings.preferredExternalSources) ||
+          state.settings.preferredExternalSources.length === 0
+        ) {
+          state.settings.preferredExternalSources = [...DEFAULT_SETTINGS.preferredExternalSources];
+        }
+        if (!Array.isArray(state.settings.localFolders)) {
+          state.settings.localFolders = [];
+        }
       }
     } catch {}
     try {
       const savedPinned = await ctx.storage.get(STORAGE_PINNED);
       if (savedPinned && typeof savedPinned === 'object') {
-        state.pinned = savedPinned;
+        const normalized = {};
+        for (const [k, val] of Object.entries(savedPinned)) {
+          const entry = normalizePinnedEntry(k, val);
+          if (entry) normalized[k] = entry;
+        }
+        state.pinned = normalized;
       }
     } catch {}
     try {
@@ -1133,218 +1839,512 @@ const createUnblockEngine = (ctx) => {
     state,
     restore,
     saveSettings,
+    clearHistory,
     rebuildLocalIndex,
     addLocalFolder,
     removeLocalFolder,
+    testCustomApi,
     scanAllCandidates,
+    scanCandidatesFor,
+    openSwitcherForTrack,
     materializeCandidate,
+    resolvePinnedDescriptor,
+    applyTemporaryCandidate,
     applyAndPinCandidate,
+    downloadCandidate,
     unpinTrack,
+    unpinAllTracks,
     resolveAudioSourceWaterfall,
     resolveLyricWaterfall,
   };
 };
 
-// ---- 样式 (遵循 EchoMusic v2.3.x 原生主题变量) ----
+// ---- 原生极简样式 (严格使用 EchoMusic surfaces.css / shapes.css 令牌，零硬编码色值) ----
 
 const CSS = `
-.emu-page {
+.emu-root {
+  height: 100%;
   display: flex;
   flex-direction: column;
-  height: 100%;
   min-height: 0;
   overflow: hidden;
+  background: var(--bg-main);
+  color: var(--color-text-main);
 }
-.emu-tabbar {
-  --custom-tab-width: 380px;
-  max-width: 100%;
+.emu-scroll {
+  flex: 1;
+  min-height: 0;
 }
-.emu-tab-label {
-  min-width: 0;
+.emu-header-details {
+  display: contents;
+}
+.emu-header-subtitle {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  line-height: 1.45;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.emu-body {
+.emu-header-stats {
   display: flex;
-  flex-direction: column;
-  gap: 16px;
-  padding: 20px 24px 48px;
-}
-.emu-card {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 16px 18px;
-  border-radius: 14px;
-  background: var(--bg-info-card, var(--control-muted-bg, rgba(128, 128, 128, 0.06)));
-  border: 1px solid var(--border-subtle, rgba(128, 128, 128, 0.14));
-}
-.emu-card-header {
-  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-.emu-card-title {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--color-text-main);
-}
-.emu-card-subtitle {
-  margin: 2px 0 0;
+  gap: 8px;
   font-size: 12px;
+  font-weight: 500;
   color: var(--color-text-secondary);
 }
-.emu-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--border-subtle, rgba(128, 128, 128, 0.1));
+.emu-header-dot {
+  opacity: 0.45;
 }
-.emu-row:last-child {
-  border-bottom: none;
-  padding-bottom: 0;
+.emu-status-on {
+  color: var(--color-primary-text);
+  font-weight: 600;
 }
-.emu-row-copy {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-}
-.emu-row-label {
-  font-size: 13px;
-  font-weight: 650;
-  color: var(--color-text-main);
-}
-.emu-row-desc {
-  font-size: 12px;
+.emu-status-off {
   color: var(--color-text-secondary);
-  line-height: 1.45;
 }
-.emu-cand-list {
+.emu-header-actions {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
 }
-.emu-cand-item {
+.emu-btn-inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.emu-collapsed-primary {
+  color: var(--color-primary-text);
+}
+.emu-collapsed-primary:hover {
+  background: var(--control-hover-bg);
+}
+.emu-collapsed-icon:hover {
+  background: var(--control-hover-bg);
+}
+
+/* 吸顶原生下划线 Tabs（严格对齐 Cloud.vue，仅 1px var(--border-subtle) 底线） */
+.emu-tabs-root {
+  width: 100%;
+}
+.emu-sticky-header {
+  position: sticky;
+  z-index: 110;
+  background: var(--bg-main);
+}
+.emu-sticky-inner {
+  padding: 0 24px;
+}
+.emu-sticky-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 56px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.emu-tabs-list {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  height: 36px;
+  background: transparent;
+  border: none;
+}
+.emu-tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.emu-sticky-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.emu-search-box {
+  width: 210px;
+  max-width: 36vw;
+}
+
+/* 主体内容区与无边框清爽分组 */
+.emu-tab-panel {
+  padding: 20px 24px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.emu-panel-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 20px;
+  border-radius: var(--radius-card, 10px);
+  background: var(--content-panel-bg);
+  border: none;
+}
+.emu-section-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 14px;
-  border-radius: 10px;
-  background: var(--control-muted-bg, rgba(128, 128, 128, 0.06));
-  border: 1px solid var(--border-subtle, rgba(128, 128, 128, 0.12));
-  transition: border-color 0.15s ease;
+  min-height: 28px;
 }
-.emu-cand-item:hover {
-  border-color: var(--color-primary);
+.emu-section-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
-.emu-cand-main {
+.emu-section-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--color-text-main);
+  line-height: 1.35;
+}
+.emu-section-sub {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.emu-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* 无边框清爽列表行（默认透明，hover 显示 var(--row-hover-bg)） */
+.emu-flat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.emu-flat-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius-item, 6px);
+  background: transparent;
+  transition: background-color 0.14s ease;
+}
+.emu-flat-row:hover {
+  background: var(--row-hover-bg);
+}
+.emu-row-main {
   display: flex;
   flex-direction: column;
   gap: 3px;
   min-width: 0;
   flex: 1;
 }
-.emu-cand-title {
+.emu-row-title-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.emu-row-title {
   font-size: 13px;
-  font-weight: 650;
+  font-weight: 600;
   color: var(--color-text-main);
-  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.emu-cand-meta {
+.emu-row-artist {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.emu-row-meta {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   font-size: 11.5px;
   color: var(--color-text-secondary);
+  line-height: 1.4;
 }
-.emu-pill {
+.emu-tag-accent {
+  color: var(--color-primary-text);
+  font-weight: 600;
+}
+.emu-tag-muted {
   display: inline-flex;
   align-items: center;
-  padding: 2px 8px;
-  border-radius: 6px;
-  font-size: 11px;
-  font-weight: 700;
-  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
-  color: var(--color-primary);
-}
-.emu-pill-neutral {
-  background: var(--control-muted-bg, rgba(128, 128, 128, 0.12));
+  padding: 1px 6px;
+  border-radius: var(--radius-detail, 4px);
+  background: var(--control-muted-bg);
   color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
 }
+.emu-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.emu-flat-row .emu-hover-reveal {
+  opacity: 0.72;
+  transition: opacity 0.14s ease;
+}
+.emu-flat-row:hover .emu-hover-reveal {
+  opacity: 1;
+}
+
 .emu-empty {
   padding: 36px 16px;
   text-align: center;
   font-size: 12.5px;
   color: var(--color-text-secondary);
+  line-height: 1.6;
 }
-.emu-modal-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-  background: rgba(0, 0, 0, 0.48);
-  backdrop-filter: blur(6px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 20px;
-}
-.emu-modal {
-  width: 100%;
-  max-width: 560px;
-  max-height: 80vh;
+
+/* 设置分组（供插件设置弹窗与页面右侧 Drawer 复用，无外框轻底色） */
+.emu-settings-panel {
   display: flex;
   flex-direction: column;
-  border-radius: 16px;
-  background: var(--bg-main, #1e1e20);
-  border: 1px solid var(--border-subtle, rgba(128, 128, 128, 0.2));
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35);
-  overflow: hidden;
+  gap: 16px;
 }
-.emu-modal-header {
+.emu-settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.emu-settings-heading {
+  margin: 0;
+  padding: 0 4px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--color-text-secondary);
+}
+.emu-settings-group {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-card, 10px);
+  background: var(--content-panel-bg);
+  border: none;
+  padding: 4px 16px;
+}
+.emu-setting-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--border-subtle, rgba(128, 128, 128, 0.14));
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-subtle);
 }
-.emu-modal-body {
-  padding: 16px 20px;
-  overflow-y: auto;
+.emu-setting-row:last-child {
+  border-bottom: none;
+}
+.emu-setting-copy {
   display: flex;
   flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.emu-setting-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-main);
+}
+.emu-setting-desc {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  line-height: 1.45;
+}
+.emu-priority-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.emu-priority-rank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-detail, 4px);
+  background: var(--control-muted-bg);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.emu-priority-rank.is-active {
+  background: var(--control-active-bg);
+  color: var(--color-primary-text);
+}
+.emu-api-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 0;
+}
+.emu-api-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.emu-api-status {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  min-width: 0;
+  flex: 1;
+}
+.emu-api-status.is-ok {
+  color: var(--color-primary-text);
+}
+.emu-api-status.is-err {
+  color: var(--control-danger-text);
+}
+.emu-settings-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-top: 4px;
+}
+
+/* 设置右侧抽屉 */
+.emu-settings-drawer {
+  width: min(440px, 90vw);
+}
+.emu-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 24px 24px;
+}
+
+/* 原生 Dialog 换源弹窗内容样式 */
+.emu-switcher-dialog {
+  width: min(640px, 92vw);
+  max-width: 92vw;
+  max-height: min(760px, calc(100vh - 140px));
+}
+.emu-dialog-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.emu-dialog-target-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.emu-status-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-card, 10px);
+  background: var(--content-panel-bg);
+  border: none;
+}
+.emu-filter-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.emu-filter-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+.emu-filter-link {
+  appearance: none;
+  background: transparent;
+  border: none;
+  padding: 4px 2px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.14s ease, border-color 0.14s ease;
+}
+.emu-filter-link:hover {
+  color: var(--color-text-main);
+}
+.emu-filter-link.is-active {
+  color: var(--color-primary-text);
+  border-bottom-color: var(--color-primary);
 }
 `;
 
 let engine = null;
 
 export function activate(ctx) {
-  const { h, defineComponent, defineAsyncComponent, computed, ref, resolveComponent } = ctx.vue;
+  const { h, defineComponent, defineAsyncComponent, computed, ref, watch, onBeforeUnmount, resolveComponent } = ctx.vue;
 
   ctx.css.inject(CSS, { id: 'echo-music-unblock-style' });
   engine = createUnblockEngine(ctx);
   void engine.restore();
 
+  const loadComponent = (name, fallbackTag = 'div') => {
+    const entry = ctx.ui?.components?.[name];
+    if (!entry) return fallbackTag;
+    if (typeof entry === 'function') return defineAsyncComponent(entry);
+    return entry;
+  };
+
+  const Button = loadComponent('Button', 'button');
+  const Switch = loadComponent('Switch', 'input');
+  const Input = loadComponent('Input', 'input');
+  const Badge = loadComponent('Badge', 'span');
+  const Tabs = loadComponent('Tabs', 'div');
+  const TabsList = loadComponent('TabsList', 'div');
+  const TabsTrigger = loadComponent('TabsTrigger', 'button');
+  const TabsContent = loadComponent('TabsContent', 'div');
+  const Dialog = loadComponent('Dialog', 'div');
+  const Drawer = loadComponent('Drawer', 'div');
+  const DrawerHeader = loadComponent('DrawerHeader', 'header');
+  const Popconfirm = loadComponent('Popconfirm', 'div');
+  const PageScrollContainer = loadComponent('PageScrollContainer', 'div');
+  const PageStickyHeader = loadComponent('PageStickyHeader', 'div');
+  const DetailPageSliverHeader = loadComponent('DetailPageSliverHeader', 'div');
+  const SongSearchInput = ctx.ui?.components?.SongSearchInput
+    ? loadComponent('SongSearchInput', Input)
+    : null;
+
   // 暴露跨插件调用桥接（供 echo-music-download 灰歌自动解灰下载与歌词刮削复用）
   globalThis.__echoMusicUnblock = {
-    version: '1.0.0',
+    version: PLUGIN_VERSION,
     resolveSongForDownload: (song, quality = '320') =>
       engine.resolveAudioSourceWaterfall(song, quality, 'download-fallback'),
     resolveLyricForDownload: (song) => engine.resolveLyricWaterfall(song),
     scanCandidates: (song, quality = '320') => engine.scanAllCandidates(song, quality),
+    openSwitcher: (song) => engine.openSwitcherForTrack(song),
+    getPinnedCount: () => Object.keys(engine.state.pinned).length,
   };
 
-  // 1. 注册 before-catalog 音源解析器（用于手动锁定源 & 本地无损直通）
+  // 1. 注册 before-catalog 音源解析器（会话试听覆盖 / 手动锁定源 / 本地无损直通）
   ctx.player.audioSource.register({
     id: 'unblock-before-catalog',
     order: 50,
@@ -1352,14 +2352,14 @@ export function activate(ctx) {
     match: ({ track }) => {
       if (!engine.state.settings.enabled) return false;
       const key = getTrackKey(track);
-      if (key && engine.state.pinned[key]) return true;
+      if (key && (engine.state.sessionOverrides[key] || engine.state.pinned[key])) return true;
       return Boolean(engine.state.settings.localPriority && engine.state.settings.enableLocal);
     },
     resolve: ({ track, quality }) =>
       engine.resolveAudioSourceWaterfall(track, quality || '320', 'before-catalog'),
   });
 
-  // 2. 注册 after-catalog 与 final-fallback 音源解析器（核心灰歌/无版权自动解灰）
+  // 2. 注册 after-catalog 与 final-fallback 音源解析器（核心灰歌/无版权自动解灰与低音质提权）
   ctx.player.audioSource.register({
     id: 'unblock-after-catalog',
     order: 100,
@@ -1391,7 +2391,8 @@ export function activate(ctx) {
   ctx.lyrics.registerResolver({
     id: 'unblock-lyric-fallback',
     order: 200,
-    match: () => Boolean(engine.state.settings.enabled && engine.state.settings.enableLyricFallback),
+    match: () =>
+      Boolean(engine.state.settings.enabled && engine.state.settings.enableLyricFallback),
     resolve: ({ track }) => engine.resolveLyricWaterfall(track),
   });
 
@@ -1402,7 +2403,24 @@ export function activate(ctx) {
       engine.state.activeTrackStatus = null;
       return;
     }
-    if (engine.state.pinned[key]) {
+    if (engine.state.sessionOverrides[key]) {
+      const o = engine.state.sessionOverrides[key];
+      engine.state.activeTrackStatus = {
+        trackKey: key,
+        channel: o.channel || 'external',
+        label: `试听 · ${o.channelLabel || '临时音源'}`,
+        quality: o.quality || '320',
+        matchedTitle: o.title,
+        matchedArtist: o.artist,
+        matchedHash: o.hash || '',
+        externalId: o.externalId || '',
+        lyricId: o.lyricId || '',
+        sourcePlatform: o.sourcePlatform || '',
+        baseKey: o.baseKey || '',
+        url: o.url,
+        isTemporary: true,
+      };
+    } else if (engine.state.pinned[key]) {
       const p = engine.state.pinned[key];
       engine.state.activeTrackStatus = {
         trackKey: key,
@@ -1411,6 +2429,11 @@ export function activate(ctx) {
         quality: p.quality || '320',
         matchedTitle: p.title,
         matchedArtist: p.artist,
+        matchedHash: p.hash || '',
+        externalId: p.externalId || '',
+        lyricId: p.lyricId || '',
+        sourcePlatform: p.sourcePlatform || '',
+        baseKey: p.localItem?.baseKey || '',
         url: p.url,
       };
     } else if (engine.state.activeTrackStatus?.trackKey !== key) {
@@ -1418,32 +2441,7 @@ export function activate(ctx) {
     }
   });
 
-  const Button = defineAsyncComponent(ctx.ui.components.Button);
-  const Switch = defineAsyncComponent(ctx.ui.components.Switch);
-  const Input = defineAsyncComponent(ctx.ui.components.Input);
-  const Badge = defineAsyncComponent(ctx.ui.components.Badge);
-  const CustomTabBar = defineAsyncComponent(ctx.ui.components.CustomTabBar);
-  const PageScrollContainer = defineAsyncComponent(ctx.ui.components.PageScrollContainer);
-  const PageStickyHeader = defineAsyncComponent(ctx.ui.components.PageStickyHeader);
-  const DetailPageSliverHeader = defineAsyncComponent(ctx.ui.components.DetailPageSliverHeader);
-
-  const triggerCandidateScan = async () => {
-    const track = ctx.player?.currentTrack?.value;
-    if (!track) {
-      ctx.toast.info('当前没有正在播放的歌曲');
-      return;
-    }
-    engine.state.scanningCandidates = true;
-    engine.state.candidates = [];
-    try {
-      const list = await engine.scanAllCandidates(track, 'flac');
-      engine.state.candidates = list;
-    } finally {
-      engine.state.scanningCandidates = false;
-    }
-  };
-
-  // 4. 注册播放栏右侧音源徽标与快速换源按钮
+  // 4. 注册播放栏右侧音源徽标与快速换源按钮（严格绑定 currentTrack）
   ctx.ui.playerbar.register({
     id: 'unblock-switcher',
     title: '音源解灰与换源',
@@ -1457,243 +2455,896 @@ export function activate(ctx) {
       return CHANNEL_META[status.channel]?.short || '解灰';
     },
     onClick: () => {
-      engine.state.dialogOpen = true;
-      void triggerCandidateScan();
+      void engine.openSwitcherForTrack(ctx.player?.currentTrack?.value ?? null);
     },
   });
 
-  // 5. 手动换源浮层组件 (Teleport)
-  const SwitcherModal = defineComponent({
-    name: 'EchoMusicUnblockModal',
-    setup() {
-      const currentTrack = computed(() => ctx.player?.currentTrack?.value ?? null);
-      return () => {
-        if (!engine.state.dialogOpen) return null;
-        const track = currentTrack.value;
-        const meta = extractSongMeta(track);
-        const trackKey = getTrackKey(track);
-        const isPinned = Boolean(trackKey && engine.state.pinned[trackKey]);
-        const activeStatus = engine.state.activeTrackStatus;
+  const navigateToUnblockPage = () => {
+    try {
+      if (ctx.router?.push) {
+        void ctx.router.push({
+          name: 'plugin-page',
+          params: { pluginId: ctx.id || 'echo-music-unblock', pageId: 'unblock' },
+        });
+        return;
+      }
+    } catch {}
+    try {
+      if (ctx.router?.push) {
+        void ctx.router.push(`/plugin/${ctx.id || 'echo-music-unblock'}/unblock`);
+      }
+    } catch {}
+  };
 
-        return h(
-          'div',
-          {
-            class: 'emu-modal-backdrop',
-            onClick: (e) => {
-              if (e.target === e.currentTarget) engine.state.dialogOpen = false;
-            },
+  // ---- 独立轻量设置面板（复用于 ctx.ui.settings.define 与页面右侧 Drawer，绝不嵌套 PageScrollContainer） ----
+  const createSettingsPanel = ({ showOpenPageButton = false } = {}) =>
+    defineComponent({
+      name: showOpenPageButton ? 'EchoMusicUnblockSettingsDialogPanel' : 'EchoMusicUnblockSettingsPanel',
+      setup() {
+        const Icon = resolveComponent('Icon');
+        const customApiDraft = ref(engine.state.settings.customApiUrl || '');
+        let debounceTimer = null;
+
+        watch(
+          () => engine.state.settings.customApiUrl,
+          (val) => {
+            if (String(val ?? '') !== customApiDraft.value) {
+              customApiDraft.value = String(val ?? '');
+            }
           },
-          [
-            h('div', { class: 'emu-modal' }, [
-              h('div', { class: 'emu-modal-header' }, [
-                h('div', null, [
-                  h('h3', { class: 'emu-card-title' }, '音源诊断与手动换源'),
-                  h(
-                    'p',
-                    { class: 'emu-card-subtitle' },
-                    meta.title ? `${meta.title} - ${meta.artist || '未知歌手'}` : '当前未播放歌曲',
-                  ),
-                ]),
-                h(
-                  Button,
-                  {
-                    variant: 'ghost',
-                    size: 'xs',
-                    onClick: () => {
-                      engine.state.dialogOpen = false;
-                    },
-                  },
-                  { default: () => '关闭' },
+        );
+
+        const flushCustomApi = () => {
+          if (debounceTimer) {
+            clearTimeout(debounceTimer);
+            debounceTimer = null;
+          }
+          const trimmed = String(customApiDraft.value || '').trim();
+          if (trimmed !== engine.state.settings.customApiUrl) {
+            void engine.saveSettings({ customApiUrl: trimmed });
+          }
+        };
+
+        const handleCustomApiInput = (v) => {
+          customApiDraft.value = String(v ?? '');
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            debounceTimer = null;
+            void engine.saveSettings({ customApiUrl: String(customApiDraft.value || '').trim() });
+          }, 450);
+        };
+
+        onBeforeUnmount(() => {
+          flushCustomApi();
+        });
+
+        // 构造带排序顺序的外部平台列表：已启用的按 preferredExternalSources 排序，未启用的排在后方
+        const orderedPlatforms = computed(() => {
+          const activeIds = Array.isArray(engine.state.settings.preferredExternalSources)
+            ? engine.state.settings.preferredExternalSources
+            : [];
+          const activeList = activeIds
+            .map((id) => EXTERNAL_PLATFORMS.find((p) => p.id === id))
+            .filter(Boolean)
+            .map((p, idx) => ({ ...p, enabled: true, rank: idx + 1 }));
+          const inactiveList = EXTERNAL_PLATFORMS.filter((p) => !activeIds.includes(p.id)).map((p) => ({
+            ...p,
+            enabled: false,
+            rank: null,
+          }));
+          return [...activeList, ...inactiveList];
+        });
+
+        const togglePlatform = (platformId, nextEnabled) => {
+          const current = Array.isArray(engine.state.settings.preferredExternalSources)
+            ? [...engine.state.settings.preferredExternalSources]
+            : [];
+          let next;
+          if (nextEnabled) {
+            next = current.includes(platformId) ? current : [...current, platformId];
+          } else {
+            next = current.filter((id) => id !== platformId);
+          }
+          void engine.saveSettings({ preferredExternalSources: next });
+        };
+
+        const movePlatform = (platformId, delta) => {
+          const current = Array.isArray(engine.state.settings.preferredExternalSources)
+            ? [...engine.state.settings.preferredExternalSources]
+            : [];
+          const idx = current.indexOf(platformId);
+          const targetIdx = idx + delta;
+          if (idx < 0 || targetIdx < 0 || targetIdx >= current.length) return;
+          const [moved] = current.splice(idx, 1);
+          current.splice(targetIdx, 0, moved);
+          void engine.saveSettings({ preferredExternalSources: current });
+        };
+
+        const renderToggleRow = (label, desc, value, onChange, { disabled = false } = {}) =>
+          h('div', { class: 'emu-setting-row' }, [
+            h('div', { class: 'emu-setting-copy' }, [
+              h('span', { class: 'emu-setting-label' }, label),
+              h('span', { class: 'emu-setting-desc' }, desc),
+            ]),
+            h(Switch, {
+              modelValue: Boolean(value),
+              disabled,
+              size: 'sm',
+              'onUpdate:modelValue': (v) => onChange(Boolean(v)),
+            }),
+          ]);
+
+        return () => {
+          const s = engine.state.settings;
+          const enabledPlatformCount = Array.isArray(s.preferredExternalSources)
+            ? s.preferredExternalSources.length
+            : 0;
+
+          return h('div', { class: 'emu-settings-panel' }, [
+            h('div', { class: 'emu-settings-section' }, [
+              h('h4', { class: 'emu-settings-heading' }, '解灰通道与音质'),
+              h('div', { class: 'emu-settings-group' }, [
+                renderToggleRow(
+                  '启用音源自动解灰',
+                  '酷狗曲库无版权或灰歌无法播放时自动按通道接管解析',
+                  s.enabled,
+                  (v) => engine.saveSettings({ enabled: v }),
+                ),
+                renderToggleRow(
+                  '本地曲库直通优先',
+                  '若本地已授权目录存在同名无损或高品质音频，优先直通免耗流量',
+                  s.localPriority,
+                  (v) => engine.saveSettings({ localPriority: v }),
+                  { disabled: !s.enabled || !s.enableLocal },
+                ),
+                renderToggleRow(
+                  '启用本地目录匹配',
+                  '允许解灰引擎检索本地音乐目录与歌曲下载目录中的音频文件',
+                  s.enableLocal,
+                  (v) => engine.saveSettings({ enableLocal: v }),
+                  { disabled: !s.enabled },
+                ),
+                renderToggleRow(
+                  '酷狗同曲异版智能替换',
+                  '自动检索酷狗内同名同歌手的其他可播专辑版本（智能过滤伴奏与 DJ 版）',
+                  s.enableKugouAlt,
+                  (v) => engine.saveSettings({ enableKugouAlt: v }),
+                  { disabled: !s.enabled },
+                ),
+                renderToggleRow(
+                  '外部多平台音源解灰',
+                  '当酷狗曲库无可用版本时，通过外部多平台聚合接口自动匹配播放',
+                  s.enableExternalApi,
+                  (v) => engine.saveSettings({ enableExternalApi: v }),
+                  { disabled: !s.enabled },
+                ),
+                renderToggleRow(
+                  '低音质自动提权 (128k → 320k/FLAC)',
+                  '当目标音质为 320k/FLAC 但曲库仅返回 128k 时，尝试升级为高品音源',
+                  s.upgradeLowQuality,
+                  (v) => engine.saveSettings({ upgradeLowQuality: v }),
+                  { disabled: !s.enabled },
                 ),
               ]),
-              h('div', { class: 'emu-modal-body' }, [
-                activeStatus
-                  ? h('div', { class: 'emu-cand-item' }, [
-                      h('div', { class: 'emu-cand-main' }, [
-                        h('div', { class: 'emu-cand-title' }, `当前生效：${activeStatus.label}`),
-                        h('div', { class: 'emu-cand-meta' }, [
-                          h('span', { class: 'emu-pill' }, String(activeStatus.quality || '320').toUpperCase()),
-                          h('span', null, `${activeStatus.matchedTitle || meta.title}`),
-                        ]),
+            ]),
+
+            h('div', { class: 'emu-settings-section' }, [
+              h('h4', { class: 'emu-settings-heading' }, '歌词兜底'),
+              h('div', { class: 'emu-settings-group' }, [
+                renderToggleRow(
+                  '多源歌词自动兜底',
+                  '缺失歌词时依次尝试本地 .lrc、酷狗异版、网易云与 LRCLIB',
+                  s.enableLyricFallback,
+                  (v) => engine.saveSettings({ enableLyricFallback: v }),
+                  { disabled: !s.enabled },
+                ),
+                renderToggleRow(
+                  '自动合并中译双语歌词',
+                  '通过网易云兜底歌词时自动合并原文与中文翻译时间戳',
+                  s.bilingualLyric,
+                  (v) => engine.saveSettings({ bilingualLyric: v }),
+                  { disabled: !s.enabled || !s.enableLyricFallback },
+                ),
+              ]),
+            ]),
+
+            h('div', { class: 'emu-settings-section' }, [
+              h('h4', { class: 'emu-settings-heading' }, '外部平台优先级'),
+              h(
+                'div',
+                { class: 'emu-settings-group' },
+                orderedPlatforms.value.map((plat) =>
+                  h('div', { class: 'emu-setting-row', key: plat.id }, [
+                    h('div', { class: 'emu-priority-controls' }, [
+                      h(
+                        'span',
+                        { class: ['emu-priority-rank', plat.enabled ? 'is-active' : ''] },
+                        plat.enabled ? String(plat.rank) : '—',
+                      ),
+                      h('div', { class: 'emu-setting-copy' }, [
+                        h('span', { class: 'emu-setting-label' }, plat.label),
+                        h('span', { class: 'emu-setting-desc' }, plat.short),
                       ]),
-                      isPinned
+                    ]),
+                    h('div', { class: 'emu-priority-controls' }, [
+                      plat.enabled
                         ? h(
                             Button,
                             {
-                              variant: 'outline',
-                              size: 'xs',
-                              onClick: () => engine.unpinTrack(track),
+                              variant: 'ghost',
+                              size: 'icon',
+                              tooltip: '上移优先级',
+                              disabled: plat.rank <= 1,
+                              onClick: () => movePlatform(plat.id, -1),
                             },
-                            { default: () => '解除锁定' },
+                            {
+                              default: () =>
+                                h(Icon, {
+                                  icon: ctx.icons?.iconChevronUp || ctx.icons?.iconArrowUp || 'tabler:chevron-up',
+                                  width: 14,
+                                  height: 14,
+                                }),
+                            },
+                          )
+                        : null,
+                      plat.enabled
+                        ? h(
+                            Button,
+                            {
+                              variant: 'ghost',
+                              size: 'icon',
+                              tooltip: '下移优先级',
+                              disabled: plat.rank >= enabledPlatformCount,
+                              onClick: () => movePlatform(plat.id, 1),
+                            },
+                            {
+                              default: () =>
+                                h(Icon, {
+                                  icon: ctx.icons?.iconChevronDown || ctx.icons?.iconArrowDown || 'tabler:chevron-down',
+                                  width: 14,
+                                  height: 14,
+                                }),
+                            },
+                          )
+                        : null,
+                      h(Switch, {
+                        modelValue: plat.enabled,
+                        size: 'sm',
+                        'onUpdate:modelValue': (v) => togglePlatform(plat.id, Boolean(v)),
+                      }),
+                    ]),
+                  ]),
+                ),
+              ),
+            ]),
+
+            h('div', { class: 'emu-settings-section' }, [
+              h('h4', { class: 'emu-settings-heading' }, '自定义外部音源 API（可选）'),
+              h('div', { class: 'emu-settings-group' }, [
+                h('div', { class: 'emu-api-box' }, [
+                  h(
+                    'span',
+                    { class: 'emu-setting-desc' },
+                    '支持占位符：{title}、{artist}、{album}、{keyword}、{quality}、{hash}。留空将使用内置公共多平台源。',
+                  ),
+                  h(Input, {
+                    modelValue: customApiDraft.value,
+                    placeholder: 'https://your-api.example.com/match?title={title}&artist={artist}&quality={quality}',
+                    size: 'compact',
+                    'onUpdate:modelValue': handleCustomApiInput,
+                    onBlur: flushCustomApi,
+                  }),
+                  h('div', { class: 'emu-api-actions' }, [
+                    h(
+                      'span',
+                      {
+                        class: [
+                          'emu-api-status',
+                          engine.state.testApiOk === true
+                            ? 'is-ok'
+                            : engine.state.testApiOk === false
+                              ? 'is-err'
+                              : '',
+                        ],
+                      },
+                      engine.state.testApiResult || '输入后自动保存，可点击右侧按钮验证接口返回格式',
+                    ),
+                    h(
+                      Button,
+                      {
+                        variant: 'soft-secondary',
+                        size: 'xs',
+                        loading: engine.state.testingApi,
+                        disabled: engine.state.testingApi || !customApiDraft.value.trim(),
+                        onClick: () => {
+                          flushCustomApi();
+                          void engine.testCustomApi(customApiDraft.value);
+                        },
+                      },
+                      { default: () => (engine.state.testingApi ? '测试中…' : '测试连通性') },
+                    ),
+                  ]),
+                ]),
+              ]),
+            ]),
+
+            showOpenPageButton
+              ? h('div', { class: 'emu-settings-footer' }, [
+                  h(
+                    Button,
+                    {
+                      variant: 'soft-primary',
+                      size: 'default',
+                      onClick: navigateToUnblockPage,
+                    },
+                    {
+                      default: () =>
+                        h('span', { class: 'emu-btn-inner' }, [
+                          h(Icon, {
+                            icon: ctx.icons?.iconExternalLink || ctx.icons?.iconSparkles || 'tabler:external-link',
+                            width: 15,
+                            height: 15,
+                          }),
+                          h('span', null, '打开音源解灰中心'),
+                        ]),
+                    },
+                  ),
+                ])
+              : null,
+          ]);
+        };
+      },
+    });
+
+  const UnblockSettingsPanel = createSettingsPanel({ showOpenPageButton: false });
+  const UnblockSettingsDialogPanel = createSettingsPanel({ showOpenPageButton: true });
+
+  // 5. 宿主原生 Dialog 手动换源弹窗（严格绑定 modalTargetTrack，自动支持 Esc 与弹窗栈）
+  const SwitcherDialog = defineComponent({
+    name: 'EchoMusicUnblockSwitcherDialog',
+    setup() {
+      const Icon = resolveComponent('Icon');
+      const currentTrack = computed(() => ctx.player?.currentTrack?.value ?? null);
+      const targetTrack = computed(() => engine.state.modalTargetTrack || currentTrack.value);
+      const channelFilter = ref('all');
+
+      watch(
+        () => getTrackKey(targetTrack.value),
+        () => {
+          channelFilter.value = 'all';
+        },
+      );
+
+      const targetKey = computed(() => getTrackKey(targetTrack.value));
+      const matchedCandidates = computed(() =>
+        targetKey.value && engine.state.candidatesTrackKey === targetKey.value
+          ? engine.state.candidates
+          : [],
+      );
+      const filteredCandidates = computed(() => {
+        if (channelFilter.value === 'all') return matchedCandidates.value;
+        return matchedCandidates.value.filter((c) => c.channel === channelFilter.value);
+      });
+
+      const countByChannel = (id) => {
+        if (id === 'all') return matchedCandidates.value.length;
+        return matchedCandidates.value.filter((c) => c.channel === id).length;
+      };
+
+      return () => {
+        const track = targetTrack.value;
+        const meta = extractSongMeta(track);
+        const key = targetKey.value;
+        const currentKey = getTrackKey(currentTrack.value);
+        const isCurrentPlaying = Boolean(key && currentKey && key === currentKey);
+        const pinnedEntry = key ? engine.state.pinned[key] : null;
+        const sessionOverride = key ? engine.state.sessionOverrides[key] : null;
+        const activeStatus =
+          engine.state.activeTrackStatus && engine.state.activeTrackStatus.trackKey === key
+            ? engine.state.activeTrackStatus
+            : null;
+        const hasDownloadBridge = Boolean(globalThis.__echoMusicDownload);
+
+        const targetDescParts = [];
+        if (meta.title) {
+          targetDescParts.push(meta.artist ? `${meta.title} - ${meta.artist}` : meta.title);
+          if (meta.album) targetDescParts.push(`专辑：${meta.album}`);
+          if (meta.duration > 0) targetDescParts.push(formatDuration(meta.duration));
+        }
+
+        return h(
+          Dialog,
+          {
+            open: engine.state.dialogOpen,
+            title: '音源诊断与手动换源',
+            showClose: true,
+            contentClass: 'emu-switcher-dialog',
+            'onUpdate:open': (val) => {
+              engine.state.dialogOpen = Boolean(val);
+            },
+          },
+          {
+            description: () =>
+              h('span', { class: 'emu-dialog-target-meta' }, [
+                h('span', null, targetDescParts.join(' · ') || '当前未选择歌曲'),
+                meta.title
+                  ? h(
+                      'span',
+                      { class: 'emu-tag-muted' },
+                      isCurrentPlaying ? '正在播放' : '指定歌曲',
+                    )
+                  : null,
+              ]),
+            default: () =>
+              h('div', { class: 'emu-dialog-stack' }, [
+                // 当前目标曲目生效/锁定状态条
+                pinnedEntry || sessionOverride || activeStatus
+                  ? h('div', { class: 'emu-status-banner' }, [
+                      h('div', { class: 'emu-row-main' }, [
+                        h(
+                          'div',
+                          { class: 'emu-row-title' },
+                          pinnedEntry
+                            ? `已锁定音源：${pinnedEntry.channelLabel}`
+                            : sessionOverride
+                              ? `本次试听：${sessionOverride.channelLabel}`
+                              : `当前生效：${activeStatus.label}`,
+                        ),
+                        h('div', { class: 'emu-row-meta' }, [
+                          h(
+                            'span',
+                            { class: 'emu-tag-accent' },
+                            String(
+                              (pinnedEntry || sessionOverride || activeStatus)?.quality || '320',
+                            ).toUpperCase(),
+                          ),
+                          h(
+                            'span',
+                            null,
+                            pinnedEntry
+                              ? formatPinnedDescriptorHint(pinnedEntry)
+                              : `${(sessionOverride || activeStatus)?.title || activeStatus?.matchedTitle || meta.title}`,
+                          ),
+                        ]),
+                      ]),
+                      pinnedEntry
+                        ? h(
+                            Popconfirm,
+                            {
+                              title: '解除该歌曲的音源锁定？',
+                              description: '解除后将恢复自动解灰与默认曲库播放。',
+                              tone: 'danger',
+                              confirmText: '解除锁定',
+                              onConfirm: () => engine.unpinTrack(track),
+                            },
+                            {
+                              trigger: () =>
+                                h(
+                                  Button,
+                                  { variant: 'outline', size: 'xs' },
+                                  { default: () => '解除锁定' },
+                                ),
+                            },
                           )
                         : null,
                     ])
                   : null,
-                h('div', { class: 'emu-card-header' }, [
-                  h('span', { class: 'emu-row-label' }, '全通道候选音源'),
+
+                // 通道筛选文字链接 + 重新扫描
+                h('div', { class: 'emu-filter-bar' }, [
+                  h(
+                    'div',
+                    { class: 'emu-filter-links' },
+                    CHANNEL_FILTERS.map((f) => {
+                      const cnt = countByChannel(f.id);
+                      return h(
+                        'button',
+                        {
+                          key: f.id,
+                          type: 'button',
+                          class: ['emu-filter-link', channelFilter.value === f.id ? 'is-active' : ''],
+                          onClick: () => {
+                            channelFilter.value = f.id;
+                          },
+                        },
+                        cnt > 0 ? `${f.label} (${cnt})` : f.label,
+                      );
+                    }),
+                  ),
                   h(
                     Button,
                     {
                       variant: 'soft-primary',
                       size: 'xs',
+                      loading: engine.state.scanningCandidates,
                       disabled: engine.state.scanningCandidates || !track,
-                      onClick: triggerCandidateScan,
+                      onClick: () => engine.scanCandidatesFor(track, 'flac'),
                     },
-                    { default: () => (engine.state.scanningCandidates ? '正在检索…' : '重新扫描') },
+                    { default: () => (engine.state.scanningCandidates ? '检索中…' : '重新扫描') },
                   ),
                 ]),
+
+                // 候选列表
                 engine.state.scanningCandidates
                   ? h('div', { class: 'emu-empty' }, '正在检索本地曲库、酷狗异版与多平台外部音源…')
-                  : engine.state.candidates.length === 0
-                    ? h('div', { class: 'emu-empty' }, '暂未找到候选替换音源')
+                  : filteredCandidates.value.length === 0
+                    ? h(
+                        'div',
+                        { class: 'emu-empty' },
+                        matchedCandidates.value.length === 0
+                          ? '暂未找到候选替换音源，可点击「重新扫描」或检查通道设置'
+                          : '当前筛选通道下暂无候选音源',
+                      )
                     : h(
                         'div',
-                        { class: 'emu-cand-list' },
-                        engine.state.candidates.map((cand) =>
-                          h('div', { class: 'emu-cand-item', key: cand.id }, [
-                            h('div', { class: 'emu-cand-main' }, [
-                              h('div', { class: 'emu-cand-title' }, `${cand.title} - ${cand.artist || '未知歌手'}`),
-                              h('div', { class: 'emu-cand-meta' }, [
-                                h('span', { class: 'emu-pill' }, cand.channelLabel),
-                                h('span', { class: 'emu-pill emu-pill-neutral' }, String(cand.quality || '320').toUpperCase()),
-                                h('span', null, `匹配度 ${Math.round((cand.score || 0) * 100)}%`),
+                        { class: 'emu-flat-list' },
+                        filteredCandidates.value.map((cand) => {
+                          const durCompare = formatDurationCompare(meta.duration, cand.duration);
+                          const sameAlbum =
+                            meta.album &&
+                            cand.album &&
+                            normalizeText(meta.album) === normalizeText(cand.album);
+                          return h('div', { class: 'emu-flat-row', key: cand.id }, [
+                            h('div', { class: 'emu-row-main' }, [
+                              h('div', { class: 'emu-row-title-line' }, [
+                                h('span', { class: 'emu-row-title' }, cand.title || meta.title),
+                                cand.artist
+                                  ? h('span', { class: 'emu-row-artist' }, `· ${cand.artist}`)
+                                  : null,
+                              ]),
+                              h('div', { class: 'emu-row-meta' }, [
+                                h('span', { class: 'emu-tag-accent' }, cand.channelLabel),
+                                h(
+                                  'span',
+                                  { class: 'emu-tag-muted' },
+                                  String(cand.quality || '320').toUpperCase(),
+                                ),
+                                h('span', null, `匹配 ${Math.round((cand.score || 0) * 100)}%`),
+                                cand.album
+                                  ? h(
+                                      'span',
+                                      { class: sameAlbum ? 'emu-tag-accent' : '' },
+                                      sameAlbum ? `专辑一致 · ${cand.album}` : `专辑：${cand.album}`,
+                                    )
+                                  : null,
+                                durCompare ? h('span', null, durCompare) : null,
                               ]),
                             ]),
-                            h(
-                              Button,
-                              {
-                                variant: 'soft-primary',
-                                size: 'xs',
-                                onClick: () => engine.applyAndPinCandidate(track, cand),
-                              },
-                              { default: () => '使用此源' },
-                            ),
-                          ]),
-                        ),
+                            h('div', { class: 'emu-row-actions' }, [
+                              hasDownloadBridge
+                                ? h(
+                                    Button,
+                                    {
+                                      variant: 'ghost',
+                                      size: 'xs',
+                                      tooltip: '使用此候选音源下载',
+                                      onClick: () => engine.downloadCandidate(track, cand),
+                                    },
+                                    {
+                                      default: () =>
+                                        h('span', { class: 'emu-btn-inner' }, [
+                                          h(Icon, {
+                                            icon:
+                                              ctx.icons?.iconArrowBarToDown ||
+                                              ctx.icons?.iconCloudDownload ||
+                                              'tabler:download',
+                                            width: 14,
+                                            height: 14,
+                                          }),
+                                          h('span', null, '下载此音源'),
+                                        ]),
+                                    },
+                                  )
+                                : null,
+                              h(
+                                Button,
+                                {
+                                  variant: 'soft-secondary',
+                                  size: 'xs',
+                                  onClick: () => engine.applyTemporaryCandidate(track, cand),
+                                },
+                                { default: () => '仅本次试听' },
+                              ),
+                              h(
+                                Button,
+                                {
+                                  variant: 'soft-primary',
+                                  size: 'xs',
+                                  onClick: () => engine.applyAndPinCandidate(track, cand),
+                                },
+                                { default: () => '切换并锁定' },
+                              ),
+                            ]),
+                          ]);
+                        }),
                       ),
               ]),
-            ]),
-          ],
+          },
         );
       };
     },
   });
 
-  ctx.ui.teleport(SwitcherModal, { id: 'echo-music-unblock-modal' });
+  ctx.ui.teleport(SwitcherDialog, { id: 'echo-music-unblock-modal' });
 
-  // 6. 主管理页面 (DetailPageSliverHeader + PageStickyHeader + CustomTabBar)
+  // 6. 主管理页面（DetailPageSliverHeader + 原生下划线 Tabs + 设置侧滑 Drawer）
   const UnblockPage = defineComponent({
     name: 'EchoMusicUnblockPage',
     setup() {
       const Icon = resolveComponent('Icon');
-      const activeTab = ref('diagnostics');
+      const activeTab = ref('history');
       const headerRef = ref(null);
+      const settingsDrawerOpen = ref(false);
+      const searchQuery = ref('');
       const stickyTop = computed(() => headerRef.value?.currentHeight ?? 56);
       const currentTrack = computed(() => ctx.player?.currentTrack?.value ?? null);
-      const coverUrl = computed(() =>
-        ctx.cover.createThemedIconCoverUrl({ icon: ctx.icons.iconSparkles || ctx.icons.iconMusic }),
+      const coverUrl = computed(
+        () =>
+          ctx.cover?.createThemedIconCoverUrl?.({
+            icon: ctx.icons?.iconSparkles || ctx.icons?.iconMusic,
+          }) || '',
       );
 
-      const tabs = [
-        { value: 'diagnostics', label: '音源诊断与记录', count: () => engine.state.history.length },
-        { value: 'local', label: '本地曲库直通', count: () => engine.state.localIndex.length },
-        { value: 'settings', label: '通道与接口设置', count: () => 0 },
-      ];
-      const tabValues = tabs.map((t) => t.value);
-      const tabLabels = tabs.map((t) => t.label);
-      const tabIndex = computed({
-        get: () => Math.max(0, tabValues.indexOf(activeTab.value)),
-        set: (idx) => {
-          const next = tabValues[idx];
-          if (next) activeTab.value = next;
-        },
+      watch(activeTab, () => {
+        searchQuery.value = '';
       });
 
-      const renderDiagnosticsTab = () => {
+      const pinnedEntries = computed(() =>
+        Object.values(engine.state.pinned).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
+      );
+
+      const filteredHistory = computed(() => {
+        const q = searchQuery.value.trim().toLowerCase();
+        if (!q) return engine.state.history;
+        return engine.state.history.filter(
+          (item) =>
+            String(item.title || '').toLowerCase().includes(q) ||
+            String(item.artist || '').toLowerCase().includes(q) ||
+            String(item.channelLabel || '').toLowerCase().includes(q),
+        );
+      });
+
+      const filteredPinned = computed(() => {
+        const q = searchQuery.value.trim().toLowerCase();
+        if (!q) return pinnedEntries.value;
+        return pinnedEntries.value.filter(
+          (item) =>
+            String(item.targetTitle || item.title || '').toLowerCase().includes(q) ||
+            String(item.targetArtist || item.artist || '').toLowerCase().includes(q) ||
+            String(item.channelLabel || '').toLowerCase().includes(q) ||
+            String(item.sourcePlatform || '').toLowerCase().includes(q),
+        );
+      });
+
+      const filteredLocalTracks = computed(() => {
+        const q = searchQuery.value.trim().toLowerCase();
+        const list = q
+          ? engine.state.localIndex.filter(
+              (item) =>
+                String(item.title || item.name || '').toLowerCase().includes(q) ||
+                String(item.artist || '').toLowerCase().includes(q) ||
+                String(item.folderName || '').toLowerCase().includes(q),
+            )
+          : engine.state.localIndex;
+        return list.slice(0, 60);
+      });
+
+      const searchPlaceholder = computed(() => {
+        if (activeTab.value === 'pinned') return '搜索已锁定歌曲…';
+        if (activeTab.value === 'local') return '搜索本地音频…';
+        return '搜索解灰记录…';
+      });
+
+      const renderSearchInput = () =>
+        SongSearchInput
+          ? h(SongSearchInput, {
+              modelValue: searchQuery.value,
+              placeholder: searchPlaceholder.value,
+              'onUpdate:modelValue': (v) => {
+                searchQuery.value = String(v ?? '');
+              },
+            })
+          : h('div', { class: 'emu-search-box' }, [
+              h(Input, {
+                modelValue: searchQuery.value,
+                placeholder: searchPlaceholder.value,
+                size: 'compact',
+                'onUpdate:modelValue': (v) => {
+                  searchQuery.value = String(v ?? '');
+                },
+              }),
+            ]);
+
+      const renderHistoryTab = () => {
         const track = currentTrack.value;
         const meta = extractSongMeta(track);
-        return h('div', { class: 'emu-body' }, [
-          h('div', { class: 'emu-card' }, [
-            h('div', { class: 'emu-card-header' }, [
-              h('div', null, [
-                h('h3', { class: 'emu-card-title' }, '当前播放歌曲诊断'),
+        const currentKey = getTrackKey(track);
+        const currentPinned = currentKey ? engine.state.pinned[currentKey] : null;
+        const currentActive =
+          engine.state.activeTrackStatus && engine.state.activeTrackStatus.trackKey === currentKey
+            ? engine.state.activeTrackStatus
+            : null;
+        const inlineCandidates =
+          currentKey && engine.state.candidatesTrackKey === currentKey
+            ? engine.state.candidates.slice(0, 5)
+            : [];
+
+        return h('div', { class: 'emu-tab-panel' }, [
+          // 区块 1：当前播放歌曲诊断
+          h('section', { class: 'emu-panel-group' }, [
+            h('div', { class: 'emu-section-head' }, [
+              h('div', { class: 'emu-section-copy' }, [
+                h('h3', { class: 'emu-section-title' }, '当前播放诊断'),
                 h(
                   'p',
-                  { class: 'emu-card-subtitle' },
-                  meta.title ? `${meta.title} · ${meta.artist || '未知歌手'}` : '暂未播放歌曲',
+                  { class: 'emu-section-sub' },
+                  meta.title
+                    ? `${meta.title}${meta.artist ? ` · ${meta.artist}` : ''}${
+                        currentPinned
+                          ? ` · 已锁定 (${currentPinned.channelLabel})`
+                          : currentActive
+                            ? ` · ${currentActive.label}`
+                            : ' · 原生曲库'
+                      }`
+                    : '当前未播放歌曲，开始播放后可在此快速检测可用替换音源',
                 ),
               ]),
-              h(
-                Button,
-                {
-                  variant: 'soft-primary',
-                  size: 'sm',
-                  disabled: !track || engine.state.scanningCandidates,
-                  onClick: triggerCandidateScan,
-                },
-                { default: () => (engine.state.scanningCandidates ? '扫描中…' : '扫描可用音源') },
-              ),
+              h('div', { class: 'emu-section-actions' }, [
+                currentPinned
+                  ? h(
+                      Popconfirm,
+                      {
+                        title: '解除当前歌曲的音源锁定？',
+                        tone: 'danger',
+                        confirmText: '解除锁定',
+                        onConfirm: () => engine.unpinTrack(track),
+                      },
+                      {
+                        trigger: () =>
+                          h(Button, { variant: 'ghost', size: 'xs' }, { default: () => '解除锁定' }),
+                      },
+                    )
+                  : null,
+                h(
+                  Button,
+                  {
+                    variant: 'soft-secondary',
+                    size: 'xs',
+                    disabled: !track || engine.state.scanningCandidates,
+                    onClick: () => engine.scanCandidatesFor(track, 'flac'),
+                  },
+                  { default: () => (engine.state.scanningCandidates ? '扫描中…' : '扫描候选') },
+                ),
+                h(
+                  Button,
+                  {
+                    variant: 'soft-primary',
+                    size: 'xs',
+                    disabled: !track,
+                    onClick: () => engine.openSwitcherForTrack(track),
+                  },
+                  { default: () => '打开换源面板' },
+                ),
+              ]),
             ]),
-            engine.state.candidates.length > 0
+            inlineCandidates.length > 0
               ? h(
                   'div',
-                  { class: 'emu-cand-list' },
-                  engine.state.candidates.map((cand) =>
-                    h('div', { class: 'emu-cand-item', key: cand.id }, [
-                      h('div', { class: 'emu-cand-main' }, [
-                        h('div', { class: 'emu-cand-title' }, `${cand.title} - ${cand.artist}`),
-                        h('div', { class: 'emu-cand-meta' }, [
-                          h('span', { class: 'emu-pill' }, cand.channelLabel),
-                          h('span', { class: 'emu-pill emu-pill-neutral' }, String(cand.quality || '320').toUpperCase()),
-                          h('span', null, `匹配度 ${Math.round((cand.score || 0) * 100)}%`),
+                  { class: 'emu-flat-list' },
+                  inlineCandidates.map((cand) =>
+                    h('div', { class: 'emu-flat-row', key: cand.id }, [
+                      h('div', { class: 'emu-row-main' }, [
+                        h('div', { class: 'emu-row-title-line' }, [
+                          h('span', { class: 'emu-row-title' }, cand.title),
+                          cand.artist ? h('span', { class: 'emu-row-artist' }, `· ${cand.artist}`) : null,
+                        ]),
+                        h('div', { class: 'emu-row-meta' }, [
+                          h('span', { class: 'emu-tag-accent' }, cand.channelLabel),
+                          h('span', { class: 'emu-tag-muted' }, String(cand.quality || '320').toUpperCase()),
+                          h('span', null, `匹配 ${Math.round((cand.score || 0) * 100)}%`),
+                          cand.album ? h('span', null, `专辑：${cand.album}`) : null,
                         ]),
                       ]),
-                      h(
-                        Button,
-                        {
-                          variant: 'soft-primary',
-                          size: 'xs',
-                          onClick: () => engine.applyAndPinCandidate(track, cand),
-                        },
-                        { default: () => '切换并锁定' },
-                      ),
+                      h('div', { class: 'emu-row-actions' }, [
+                        h(
+                          Button,
+                          {
+                            variant: 'soft-secondary',
+                            size: 'xs',
+                            onClick: () => engine.applyTemporaryCandidate(track, cand),
+                          },
+                          { default: () => '仅本次试听' },
+                        ),
+                        h(
+                          Button,
+                          {
+                            variant: 'soft-primary',
+                            size: 'xs',
+                            onClick: () => engine.applyAndPinCandidate(track, cand),
+                          },
+                          { default: () => '切换并锁定' },
+                        ),
+                      ]),
                     ]),
                   ),
                 )
-              : h('div', { class: 'emu-empty' }, '点击右上角「扫描可用音源」可检测本地、酷狗异版与多平台音源候选'),
+              : null,
           ]),
-          h('div', { class: 'emu-card' }, [
-            h('div', { class: 'emu-card-header' }, [
-              h('h3', { class: 'emu-card-title' }, '最近自动解灰与直通记录'),
+
+          // 区块 2：最近自动解灰与直通记录
+          h('section', { class: 'emu-panel-group' }, [
+            h('div', { class: 'emu-section-head' }, [
+              h('div', { class: 'emu-section-copy' }, [
+                h('h3', { class: 'emu-section-title' }, '最近自动解灰与直通记录'),
+                h(
+                  'p',
+                  { class: 'emu-section-sub' },
+                  `共 ${engine.state.history.length} 条记录，遇到无版权或灰歌时自动接管并留痕`,
+                ),
+              ]),
               engine.state.history.length > 0
                 ? h(
-                    Button,
+                    Popconfirm,
                     {
-                      variant: 'ghost',
-                      size: 'xs',
-                      onClick: async () => {
-                        engine.state.history = [];
-                        await ctx.storage.set(STORAGE_HISTORY, []);
-                      },
+                      title: '确认清空全部解灰记录？',
+                      description: '仅清空历史流水，不影响已锁定的歌曲音源。',
+                      tone: 'danger',
+                      confirmText: '确认清空',
+                      onConfirm: () => engine.clearHistory(),
                     },
-                    { default: () => '清空记录' },
+                    {
+                      trigger: () =>
+                        h(
+                          Button,
+                          { variant: 'ghost', size: 'xs' },
+                          { default: () => '清空记录' },
+                        ),
+                    },
                   )
                 : null,
             ]),
-            engine.state.history.length === 0
-              ? h('div', { class: 'emu-empty' }, '暂无解灰记录，遇到无版权/灰歌时将自动触发接管')
+            filteredHistory.value.length === 0
+              ? h(
+                  'div',
+                  { class: 'emu-empty' },
+                  engine.state.history.length === 0
+                    ? '暂无解灰记录，播放无版权灰歌或命中本地无损曲库时将自动显示在这里'
+                    : '没有匹配当前关键词的解灰记录',
+                )
               : h(
                   'div',
-                  { class: 'emu-cand-list' },
-                  engine.state.history.map((item) =>
-                    h('div', { class: 'emu-cand-item', key: item.id }, [
-                      h('div', { class: 'emu-cand-main' }, [
-                        h('div', { class: 'emu-cand-title' }, `${item.title} - ${item.artist || '未知歌手'}`),
-                        h('div', { class: 'emu-cand-meta' }, [
-                          h('span', { class: 'emu-pill' }, item.channelLabel || item.channel),
-                          h('span', { class: 'emu-pill emu-pill-neutral' }, String(item.quality || '320').toUpperCase()),
-                          h('span', null, new Date(item.timestamp).toLocaleString()),
+                  { class: 'emu-flat-list' },
+                  filteredHistory.value.map((item) =>
+                    h('div', { class: 'emu-flat-row', key: item.id }, [
+                      h('div', { class: 'emu-row-main' }, [
+                        h('div', { class: 'emu-row-title-line' }, [
+                          h('span', { class: 'emu-row-title' }, item.title || '未知歌曲'),
+                          item.artist ? h('span', { class: 'emu-row-artist' }, `· ${item.artist}`) : null,
                         ]),
+                        h('div', { class: 'emu-row-meta' }, [
+                          h('span', { class: 'emu-tag-accent' }, item.channelLabel || item.channel),
+                          h('span', { class: 'emu-tag-muted' }, String(item.quality || '320').toUpperCase()),
+                          h('span', null, formatShortTime(item.timestamp)),
+                        ]),
+                      ]),
+                      h('div', { class: 'emu-row-actions emu-hover-reveal' }, [
+                        h(
+                          Button,
+                          {
+                            variant: 'ghost',
+                            size: 'xs',
+                            onClick: () =>
+                              engine.openSwitcherForTrack({
+                                id: item.id,
+                                hash: item.hash || '',
+                                title: item.title,
+                                artist: item.artist,
+                                album: item.album || '',
+                                duration: item.duration || 0,
+                              }),
+                          },
+                          { default: () => '重新换源' },
+                        ),
                       ]),
                     ]),
                   ),
@@ -1702,24 +3353,131 @@ export function activate(ctx) {
         ]);
       };
 
-      const renderLocalTab = () =>
-        h('div', { class: 'emu-body' }, [
-          h('div', { class: 'emu-card' }, [
-            h('div', { class: 'emu-card-header' }, [
-              h('div', null, [
-                h('h3', { class: 'emu-card-title' }, '本地无损/已下载曲库目录'),
+      const renderPinnedTab = () =>
+        h('div', { class: 'emu-tab-panel' }, [
+          h('section', { class: 'emu-panel-group' }, [
+            h('div', { class: 'emu-section-head' }, [
+              h('div', { class: 'emu-section-copy' }, [
+                h('h3', { class: 'emu-section-title' }, '已锁定音源列表'),
                 h(
                   'p',
-                  { class: 'emu-card-subtitle' },
-                  `已索引 ${engine.state.localIndex.length} 首本地音频 · ${engine.state.localLyricIndex.size} 份本地 LRC 歌词`,
+                  { class: 'emu-section-sub' },
+                  `已持久锁定 ${pinnedEntries.value.length} 首歌曲 · 已保存音源描述符，外部直链过期后播放时自动按需刷新`,
                 ),
               ]),
-              h('div', { class: 'flex items-center gap-2' }, [
+              pinnedEntries.value.length > 0
+                ? h(
+                    Popconfirm,
+                    {
+                      title: '解除全部已锁定音源？',
+                      description: `将移除全部 ${pinnedEntries.value.length} 首歌曲的手动锁定，恢复默认自动解灰策略。`,
+                      tone: 'danger',
+                      confirmText: '全部解除',
+                      onConfirm: () => engine.unpinAllTracks(),
+                    },
+                    {
+                      trigger: () =>
+                        h(
+                          Button,
+                          { variant: 'danger', size: 'xs' },
+                          { default: () => '解除全部锁定' },
+                        ),
+                    },
+                  )
+                : null,
+            ]),
+            filteredPinned.value.length === 0
+              ? h(
+                  'div',
+                  { class: 'emu-empty' },
+                  pinnedEntries.value.length === 0
+                    ? '暂无已锁定歌曲，在换源弹窗中点击「切换并锁定」即可为歌曲固定专属音源'
+                    : '没有找到匹配的已锁定歌曲',
+                )
+              : h(
+                  'div',
+                  { class: 'emu-flat-list' },
+                  filteredPinned.value.map((entry) =>
+                    h('div', { class: 'emu-flat-row', key: entry.trackKey }, [
+                      h('div', { class: 'emu-row-main' }, [
+                        h('div', { class: 'emu-row-title-line' }, [
+                          h('span', { class: 'emu-row-title' }, entry.targetTitle || entry.title || '未知歌曲'),
+                          entry.targetArtist || entry.artist
+                            ? h('span', { class: 'emu-row-artist' }, `· ${entry.targetArtist || entry.artist}`)
+                            : null,
+                        ]),
+                        h('div', { class: 'emu-row-meta' }, [
+                          h('span', { class: 'emu-tag-accent' }, entry.channelLabel || '锁定源'),
+                          h('span', { class: 'emu-tag-muted' }, String(entry.quality || '320').toUpperCase()),
+                          h('span', null, formatPinnedDescriptorHint(entry)),
+                          entry.updatedAt ? h('span', null, `更新于 ${formatShortTime(entry.updatedAt)}`) : null,
+                        ]),
+                      ]),
+                      h('div', { class: 'emu-row-actions' }, [
+                        h(
+                          Button,
+                          {
+                            variant: 'ghost',
+                            size: 'xs',
+                            onClick: () =>
+                              engine.openSwitcherForTrack({
+                                id: entry.trackKey.startsWith('id:') ? entry.trackKey.slice(3) : '',
+                                hash: entry.trackKey.startsWith('hash:') ? entry.trackKey.slice(5) : '',
+                                title: entry.targetTitle || entry.title,
+                                artist: entry.targetArtist || entry.artist,
+                                album: entry.targetAlbum || entry.album || '',
+                                duration: entry.targetDuration || entry.duration || 0,
+                              }),
+                          },
+                          { default: () => '换源' },
+                        ),
+                        h(
+                          Popconfirm,
+                          {
+                            title: '解除此歌曲的音源锁定？',
+                            description: `解除「${entry.targetTitle || entry.title || '该歌曲'}」后将恢复自动解析。`,
+                            tone: 'danger',
+                            confirmText: '解除锁定',
+                            onConfirm: () => engine.unpinTrack(entry.trackKey),
+                          },
+                          {
+                            trigger: () =>
+                              h(
+                                Button,
+                                { variant: 'ghost', size: 'xs' },
+                                { default: () => '解除锁定' },
+                              ),
+                          },
+                        ),
+                      ]),
+                    ]),
+                  ),
+                ),
+          ]),
+        ]);
+
+      const renderLocalTab = () => {
+        const dlInfo = globalThis.__echoMusicDownload?.getSaveDirInfo?.();
+        return h('div', { class: 'emu-tab-panel' }, [
+          h('section', { class: 'emu-panel-group' }, [
+            h('div', { class: 'emu-section-head' }, [
+              h('div', { class: 'emu-section-copy' }, [
+                h('h3', { class: 'emu-section-title' }, '本地无损与已下载曲库目录'),
+                h(
+                  'p',
+                  { class: 'emu-section-sub' },
+                  `已索引 ${engine.state.localIndex.length} 首音频 · ${engine.state.localLyricIndex.size} 份本地 LRC 歌词${
+                    dlInfo?.hasGrant ? ` · 已自动关联下载目录 (${dlInfo.saveDir})` : ''
+                  }`,
+                ),
+              ]),
+              h('div', { class: 'emu-section-actions' }, [
                 h(
                   Button,
                   {
                     variant: 'soft-secondary',
-                    size: 'sm',
+                    size: 'xs',
+                    loading: engine.state.localScanning,
                     disabled: engine.state.localScanning,
                     onClick: () => engine.rebuildLocalIndex(),
                   },
@@ -1729,7 +3487,7 @@ export function activate(ctx) {
                   Button,
                   {
                     variant: 'soft-primary',
-                    size: 'sm',
+                    size: 'xs',
                     onClick: () => engine.addLocalFolder(),
                   },
                   { default: () => '添加目录' },
@@ -1737,116 +3495,95 @@ export function activate(ctx) {
               ]),
             ]),
             engine.state.settings.localFolders.length === 0
-              ? h('div', { class: 'emu-empty' }, '尚未手动添加目录（若已授权歌曲下载目录，插件会自动识别并关联）')
+              ? h(
+                  'div',
+                  { class: 'emu-empty' },
+                  dlInfo?.hasGrant
+                    ? '已自动关联「歌曲下载」目录；你也可以点击右上角添加更多本地无损音乐文件夹'
+                    : '尚未手动添加本地曲库目录（授权歌曲下载目录后也将自动识别关联）',
+                )
               : h(
                   'div',
-                  { class: 'emu-cand-list' },
+                  { class: 'emu-flat-list' },
                   engine.state.settings.localFolders.map((folder) =>
-                    h('div', { class: 'emu-cand-item', key: folder.id || folder.path }, [
-                      h('div', { class: 'emu-cand-main' }, [
-                        h('div', { class: 'emu-cand-title' }, folder.name || '本地音乐目录'),
-                        h('div', { class: 'emu-cand-meta' }, [h('span', null, folder.path)]),
+                    h('div', { class: 'emu-flat-row', key: folder.id || folder.path }, [
+                      h('div', { class: 'emu-row-main' }, [
+                        h('div', { class: 'emu-row-title' }, folder.name || '本地音乐目录'),
+                        h('div', { class: 'emu-row-meta' }, [h('span', null, folder.path)]),
                       ]),
-                      h(
-                        Button,
-                        {
-                          variant: 'outline',
-                          size: 'xs',
-                          onClick: () => engine.removeLocalFolder(folder.id || folder.path),
-                        },
-                        { default: () => '移除' },
-                      ),
+                      h('div', { class: 'emu-row-actions' }, [
+                        h(
+                          Popconfirm,
+                          {
+                            title: '移除此本地曲库目录？',
+                            description: '仅取消目录索引关联，不会删除硬盘上的任何音频文件。',
+                            tone: 'danger',
+                            confirmText: '确认移除',
+                            onConfirm: () => engine.removeLocalFolder(folder.id || folder.path),
+                          },
+                          {
+                            trigger: () =>
+                              h(
+                                Button,
+                                { variant: 'ghost', size: 'xs' },
+                                { default: () => '移除' },
+                              ),
+                          },
+                        ),
+                      ]),
                     ]),
                   ),
                 ),
           ]),
-        ]);
 
-      const renderSettingsTab = () =>
-        h('div', { class: 'emu-body' }, [
-          h('div', { class: 'emu-card' }, [
-            h('h3', { class: 'emu-card-title' }, '解灰通道与优先级开关'),
-            h('div', { class: 'emu-row' }, [
-              h('div', { class: 'emu-row-copy' }, [
-                h('span', { class: 'emu-row-label' }, '启用音源自动解灰'),
-                h('span', { class: 'emu-row-desc' }, '当酷狗曲库无版权或灰歌无法播放时自动接管解析'),
-              ]),
-              h(Switch, {
-                modelValue: engine.state.settings.enabled,
-                'onUpdate:modelValue': (v) => engine.saveSettings({ enabled: Boolean(v) }),
-              }),
-            ]),
-            h('div', { class: 'emu-row' }, [
-              h('div', { class: 'emu-row-copy' }, [
-                h('span', { class: 'emu-row-label' }, '本地曲库直通优先 (Before-Catalog)'),
-                h('span', { class: 'emu-row-desc' }, '若本地目录已有同名无损/高品质音频，直接播放本地文件免消耗流量'),
-              ]),
-              h(Switch, {
-                modelValue: engine.state.settings.localPriority,
-                'onUpdate:modelValue': (v) => engine.saveSettings({ localPriority: Boolean(v) }),
-              }),
-            ]),
-            h('div', { class: 'emu-row' }, [
-              h('div', { class: 'emu-row-copy' }, [
-                h('span', { class: 'emu-row-label' }, '酷狗同曲异版智能替换'),
-                h('span', { class: 'emu-row-desc' }, '自动搜索酷狗内同名同歌手的其他可用专辑/合辑版本顶替灰歌'),
-              ]),
-              h(Switch, {
-                modelValue: engine.state.settings.enableKugouAlt,
-                'onUpdate:modelValue': (v) => engine.saveSettings({ enableKugouAlt: Boolean(v) }),
-              }),
-            ]),
-            h('div', { class: 'emu-row' }, [
-              h('div', { class: 'emu-row-copy' }, [
-                h('span', { class: 'emu-row-label' }, '外部多平台音源解灰 (GDStudio / Meting / 网易云)'),
-                h('span', { class: 'emu-row-desc' }, '当酷狗内无可用版本时，通过多平台音源接口自动匹配播放'),
-              ]),
-              h(Switch, {
-                modelValue: engine.state.settings.enableExternalApi,
-                'onUpdate:modelValue': (v) => engine.saveSettings({ enableExternalApi: Boolean(v) }),
-              }),
-            ]),
-            h('div', { class: 'emu-row' }, [
-              h('div', { class: 'emu-row-copy' }, [
-                h('span', { class: 'emu-row-label' }, '低音质自动提权 (128k → 320k/FLAC)'),
-                h('span', { class: 'emu-row-desc' }, '当目标音质为 320k/FLAC 但曲库仅返回 128k 时，尝试使用高音质源替换'),
-              ]),
-              h(Switch, {
-                modelValue: engine.state.settings.upgradeLowQuality,
-                'onUpdate:modelValue': (v) => engine.saveSettings({ upgradeLowQuality: Boolean(v) }),
-              }),
-            ]),
-            h('div', { class: 'emu-row' }, [
-              h('div', { class: 'emu-row-copy' }, [
-                h('span', { class: 'emu-row-label' }, '多源双语歌词自动兜底 (LRCLIB / 网易云双语)'),
-                h('span', { class: 'emu-row-desc' }, '缺失歌词时自动检索本地 LRC、网易云原文+翻译双语歌词与 LRCLIB'),
-              ]),
-              h(Switch, {
-                modelValue: engine.state.settings.enableLyricFallback,
-                'onUpdate:modelValue': (v) => engine.saveSettings({ enableLyricFallback: Boolean(v) }),
-              }),
-            ]),
-          ]),
-          h('div', { class: 'emu-card' }, [
-            h('h3', { class: 'emu-card-title' }, '自定义外部音源 API 模板（可选）'),
-            h(
-              'p',
-              { class: 'emu-card-subtitle' },
-              '支持占位符：{title} 歌名、{artist} 歌手、{album} 专辑、{quality} 音质、{hash} 歌曲哈希。留空则默认使用内置多平台公共源。',
-            ),
-            h(Input, {
-              modelValue: engine.state.settings.customApiUrl,
-              placeholder: '例如：https://your-api.example.com/match?title={title}&artist={artist}&quality={quality}',
-              'onUpdate:modelValue': (v) => engine.saveSettings({ customApiUrl: String(v ?? '').trim() }),
-            }),
-          ]),
+          // 已索引音频预览
+          engine.state.localIndex.length > 0
+            ? h('section', { class: 'emu-panel-group' }, [
+                h('div', { class: 'emu-section-head' }, [
+                  h('div', { class: 'emu-section-copy' }, [
+                    h('h3', { class: 'emu-section-title' }, '已索引本地音频'),
+                    h(
+                      'p',
+                      { class: 'emu-section-sub' },
+                      searchQuery.value.trim()
+                        ? `匹配 ${filteredLocalTracks.value.length} 首（最多展示 60 条）`
+                        : `展示前 ${filteredLocalTracks.value.length} 首，共 ${engine.state.localIndex.length} 首`,
+                    ),
+                  ]),
+                ]),
+                filteredLocalTracks.value.length === 0
+                  ? h('div', { class: 'emu-empty' }, '没有匹配当前搜索词的本地音频')
+                  : h(
+                      'div',
+                      { class: 'emu-flat-list' },
+                      filteredLocalTracks.value.map((item, idx) =>
+                        h('div', { class: 'emu-flat-row', key: `${item.path || item.name}-${idx}` }, [
+                          h('div', { class: 'emu-row-main' }, [
+                            h('div', { class: 'emu-row-title-line' }, [
+                              h('span', { class: 'emu-row-title' }, item.title || item.name),
+                              item.artist
+                                ? h('span', { class: 'emu-row-artist' }, `· ${item.artist}`)
+                                : null,
+                            ]),
+                            h('div', { class: 'emu-row-meta' }, [
+                              h('span', { class: 'emu-tag-accent' }, item.folderName),
+                              h('span', { class: 'emu-tag-muted' }, String(item.ext || 'mp3').toUpperCase()),
+                              h('span', null, item.name),
+                            ]),
+                          ]),
+                        ]),
+                      ),
+                    ),
+              ])
+            : null,
         ]);
+      };
 
       return () =>
-        h('div', { class: 'emu-page' }, [
+        h('div', { class: 'emu-root' }, [
           h(
             PageScrollContainer,
-            { class: 'flex-1 min-h-0' },
+            { class: 'emu-scroll' },
             {
               default: () => [
                 h(
@@ -1863,89 +3600,265 @@ export function activate(ctx) {
                   },
                   {
                     details: () =>
-                      h('div', { class: 'contents' }, [
+                      h('div', { class: 'emu-header-details' }, [
                         h(
                           'div',
-                          { class: 'text-[13px] font-semibold text-text-secondary' },
-                          '全通道无版权灰歌自动接管 · 本地曲库直通 · 酷狗异版替换 · 双语歌词兜底',
+                          { class: 'emu-header-subtitle' },
+                          '全通道灰歌自动接管 · 本地直通 · 酷狗异版 · 多平台外源与双语歌词',
                         ),
-                        h(
-                          'div',
-                          {
-                            class:
-                              'flex flex-wrap items-center gap-x-3 gap-y-2 text-[11px] font-semibold text-text-secondary',
-                          },
-                          [
-                            h('span', null, `本地索引 ${engine.state.localIndex.length} 首`),
-                            h('span', null, `已锁定 ${Object.keys(engine.state.pinned).length} 首`),
-                            h('span', null, `解灰记录 ${engine.state.history.length} 条`),
-                          ],
-                        ),
+                        h('div', { class: 'emu-header-stats' }, [
+                          h(
+                            'span',
+                            { class: engine.state.settings.enabled ? 'emu-status-on' : 'emu-status-off' },
+                            engine.state.settings.enabled ? '自动解灰已开启' : '自动解灰已暂停',
+                          ),
+                          h('span', { class: 'emu-header-dot' }, '·'),
+                          h('span', null, `本地索引 ${engine.state.localIndex.length} 首`),
+                          h('span', { class: 'emu-header-dot' }, '·'),
+                          h('span', null, `已锁定 ${pinnedEntries.value.length} 首`),
+                          h('span', { class: 'emu-header-dot' }, '·'),
+                          h('span', null, `解灰记录 ${engine.state.history.length} 条`),
+                        ]),
                       ]),
                     actions: () =>
-                      h('div', { class: 'flex flex-wrap gap-2' }, [
+                      h('div', { class: 'emu-header-actions' }, [
                         h(
                           Button,
                           {
                             variant: 'soft-primary',
                             size: 'default',
-                            class: 'flex items-center gap-2 rounded-lg text-[12px] font-semibold',
+                            onClick: () =>
+                              engine.openSwitcherForTrack(ctx.player?.currentTrack?.value ?? null),
+                          },
+                          {
+                            default: () =>
+                              h('span', { class: 'emu-btn-inner' }, [
+                                h(Icon, {
+                                  icon: ctx.icons?.iconSparkles || ctx.icons?.iconMusic || 'tabler:sparkles',
+                                  width: 16,
+                                  height: 16,
+                                }),
+                                h('span', null, '当前歌曲换源'),
+                              ]),
+                          },
+                        ),
+                        h(
+                          Button,
+                          {
+                            variant: 'soft-secondary',
+                            size: 'default',
+                            loading: engine.state.localScanning,
+                            onClick: () => engine.rebuildLocalIndex(),
+                          },
+                          {
+                            default: () =>
+                              h('span', { class: 'emu-btn-inner' }, [
+                                h(Icon, {
+                                  icon: ctx.icons?.iconRefreshCw || 'tabler:refresh',
+                                  width: 15,
+                                  height: 15,
+                                }),
+                                h('span', null, '刷新本地索引'),
+                              ]),
+                          },
+                        ),
+                        h(
+                          Button,
+                          {
+                            variant: 'ghost',
+                            size: 'icon',
+                            tooltip: '通道与接口设置',
                             onClick: () => {
-                              engine.state.dialogOpen = true;
-                              void triggerCandidateScan();
+                              settingsDrawerOpen.value = true;
                             },
                           },
                           {
-                            default: () => [
-                              h(Icon, { icon: ctx.icons.iconSparkles || ctx.icons.iconMusic, width: 16, height: 16 }),
-                              h('span', null, '当前歌曲换源'),
-                            ],
+                            default: () =>
+                              h(Icon, {
+                                icon: ctx.icons?.iconSettings || 'tabler:settings',
+                                width: 17,
+                                height: 17,
+                              }),
                           },
                         ),
                       ]),
+                    'collapsed-actions': () => [
+                      h(
+                        Button,
+                        {
+                          variant: 'unstyled',
+                          size: 'icon',
+                          class: 'action-icon emu-collapsed-primary',
+                          tooltip: '当前歌曲换源',
+                          onClick: () =>
+                            engine.openSwitcherForTrack(ctx.player?.currentTrack?.value ?? null),
+                        },
+                        {
+                          default: () =>
+                            h(Icon, {
+                              icon: ctx.icons?.iconSparkles || ctx.icons?.iconMusic || 'tabler:sparkles',
+                              width: 18,
+                              height: 18,
+                            }),
+                        },
+                      ),
+                      h(
+                        Button,
+                        {
+                          variant: 'unstyled',
+                          size: 'icon',
+                          class: 'action-icon icon-action emu-collapsed-icon',
+                          tooltip: '刷新本地索引',
+                          onClick: () => engine.rebuildLocalIndex(),
+                        },
+                        {
+                          default: () =>
+                            h(Icon, {
+                              icon: ctx.icons?.iconRefreshCw || 'tabler:refresh',
+                              width: 17,
+                              height: 17,
+                            }),
+                        },
+                      ),
+                      h(
+                        Button,
+                        {
+                          variant: 'unstyled',
+                          size: 'icon',
+                          class: 'action-icon icon-action emu-collapsed-icon',
+                          tooltip: '通道与接口设置',
+                          onClick: () => {
+                            settingsDrawerOpen.value = true;
+                          },
+                        },
+                        {
+                          default: () =>
+                            h(Icon, {
+                              icon: ctx.icons?.iconSettings || 'tabler:settings',
+                              width: 17,
+                              height: 17,
+                            }),
+                        },
+                      ),
+                    ],
                   },
                 ),
+
                 h(
-                  PageStickyHeader,
-                  { class: 'song-list-sticky sticky z-110 bg-bg-main', stickyTop: stickyTop.value },
+                  Tabs,
                   {
-                    default: () =>
-                      h('div', { class: 'px-6' }, [
-                        h(
-                          'div',
-                          { class: 'flex items-center justify-between h-14 border-b border-[var(--border-subtle)]' },
-                          [
-                            h(
-                              CustomTabBar,
-                              {
-                                class: 'emu-tabbar',
-                                modelValue: tabIndex.value,
-                                tabs: tabLabels,
-                                ariaLabel: '音源解灰导航',
-                                'onUpdate:modelValue': (idx) => {
-                                  tabIndex.value = idx;
-                                },
-                              },
-                              {
-                                tab: ({ label, index, selected }) => {
-                                  const count = tabs[index]?.count?.() ?? 0;
-                                  return [
-                                    h('span', { class: 'emu-tab-label' }, label),
-                                    count > 0 ? h(Badge, { count, tone: selected ? 'accent' : 'neutral' }) : null,
-                                  ];
-                                },
-                              },
-                            ),
-                          ],
-                        ),
-                      ]),
+                    modelValue: activeTab.value,
+                    class: 'emu-tabs-root',
+                    'onUpdate:modelValue': (val) => {
+                      if (val) activeTab.value = String(val);
+                    },
+                  },
+                  {
+                    default: () => [
+                      h(
+                        PageStickyHeader,
+                        {
+                          class: 'emu-sticky-header',
+                          stickyTop: stickyTop.value,
+                          style: { top: `${stickyTop.value}px` },
+                        },
+                        {
+                          default: () =>
+                            h('div', { class: 'emu-sticky-inner' }, [
+                              h('div', { class: 'emu-sticky-bar' }, [
+                                h(
+                                  TabsList,
+                                  { class: 'emu-tabs-list' },
+                                  {
+                                    default: () => [
+                                      h(
+                                        TabsTrigger,
+                                        { value: 'history' },
+                                        {
+                                          default: () =>
+                                            h('span', { class: 'emu-tab-label' }, [
+                                              h('span', null, '解灰与记录'),
+                                              engine.state.history.length > 0
+                                                ? h(Badge, {
+                                                    count: engine.state.history.length,
+                                                    tone: activeTab.value === 'history' ? 'accent' : 'neutral',
+                                                  })
+                                                : null,
+                                            ]),
+                                        },
+                                      ),
+                                      h(
+                                        TabsTrigger,
+                                        { value: 'pinned' },
+                                        {
+                                          default: () =>
+                                            h('span', { class: 'emu-tab-label' }, [
+                                              h('span', null, '已锁定音源'),
+                                              pinnedEntries.value.length > 0
+                                                ? h(Badge, {
+                                                    count: pinnedEntries.value.length,
+                                                    tone: activeTab.value === 'pinned' ? 'accent' : 'neutral',
+                                                  })
+                                                : null,
+                                            ]),
+                                        },
+                                      ),
+                                      h(
+                                        TabsTrigger,
+                                        { value: 'local' },
+                                        {
+                                          default: () =>
+                                            h('span', { class: 'emu-tab-label' }, [
+                                              h('span', null, '本地曲库'),
+                                              engine.state.localIndex.length > 0
+                                                ? h(Badge, {
+                                                    count: engine.state.localIndex.length,
+                                                    tone: activeTab.value === 'local' ? 'accent' : 'neutral',
+                                                  })
+                                                : null,
+                                            ]),
+                                        },
+                                      ),
+                                    ],
+                                  },
+                                ),
+                                h('div', { class: 'emu-sticky-tools' }, [renderSearchInput()]),
+                              ]),
+                            ]),
+                        },
+                      ),
+                      h(TabsContent, { value: 'history' }, { default: renderHistoryTab }),
+                      h(TabsContent, { value: 'pinned' }, { default: renderPinnedTab }),
+                      h(TabsContent, { value: 'local' }, { default: renderLocalTab }),
+                    ],
                   },
                 ),
-                activeTab.value === 'diagnostics'
-                  ? renderDiagnosticsTab()
-                  : activeTab.value === 'local'
-                    ? renderLocalTab()
-                    : renderSettingsTab(),
+              ],
+            },
+          ),
+
+          // 右侧原生设置抽屉
+          h(
+            Drawer,
+            {
+              open: settingsDrawerOpen.value,
+              title: '通道与接口设置',
+              side: 'right',
+              panelClass: 'emu-settings-drawer',
+              'onUpdate:open': (v) => {
+                settingsDrawerOpen.value = Boolean(v);
+              },
+            },
+            {
+              default: () => [
+                h(DrawerHeader, {
+                  title: '通道与接口设置',
+                  description: '配置解灰优先级、外部平台顺序、双语歌词与自定义 API',
+                  onClose: () => {
+                    settingsDrawerOpen.value = false;
+                  },
+                }),
+                h('div', { class: 'emu-drawer-body' }, [h(UnblockSettingsPanel)]),
               ],
             },
           ),
@@ -1966,25 +3879,21 @@ export function activate(ctx) {
     },
   });
 
+  // 独立轻量设置面板（绝不嵌套整页 PageScrollContainer / SliverHeader）
   ctx.ui.settings.define({
     id: 'echo-music-unblock-settings',
     title: '音源解灰与歌词兜底',
-    description: '管理灰歌自动解灰通道、本地无损曲库直通目录与外部双语歌词兜底',
-    component: UnblockPage,
+    description: '管理灰歌自动解灰通道、外部平台优先级、双语歌词兜底与自定义 API',
+    component: UnblockSettingsDialogPanel,
   });
 
+  // 右键任意歌曲换源：严格锁定目标曲目 modalTargetTrack，不误绑当前播放曲目
   ctx.ui.addSongContextMenuItem({
     id: 'unblock-match',
     label: '诊断 / 手动切换音源',
     onSelect: async (song) => {
       if (song) {
-        engine.state.dialogOpen = true;
-        engine.state.scanningCandidates = true;
-        try {
-          engine.state.candidates = await engine.scanAllCandidates(song, 'flac');
-        } finally {
-          engine.state.scanningCandidates = false;
-        }
+        await engine.openSwitcherForTrack(song);
       }
     },
   });
